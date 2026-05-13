@@ -30,6 +30,30 @@
   let clientSecret = $state('');
   let clientSecretSet = $state(false);
   let scopes = $state('');
+  // Optional override that replaces the upstream-reported server name in the
+  // relay's connected-servers advertisement.
+  let serverTypeOverride = $state('');
+  // Sanitized projection of the override input — what would actually get
+  // persisted, mirroring relay's `sanitize_server_name`. Drives both the
+  // inline preview and the validation state.
+  let serverTypeOverrideSanitized = $derived(sanitizeName(serverTypeOverride));
+  // Inline-validation flag: true only when the user has typed something
+  // that would sanitize to an empty string (i.e. unusable). Inputs that
+  // sanitize cleanly are accepted — the preview hint shows the result.
+  let serverTypeOverrideInvalid = $derived(
+    serverTypeOverride.trim() !== '' && serverTypeOverrideSanitized === ''
+  );
+  // True when the trimmed input differs from its sanitized form, so we can
+  // show a "Will be saved as: <sanitized>" preview without nagging the user
+  // when the input is already canonical.
+  let serverTypeOverridePreviewVisible = $derived(
+    serverTypeOverrideSanitized !== '' &&
+      serverTypeOverride.trim() !== serverTypeOverrideSanitized
+  );
+  // Defensive overflow flag — `maxlength={64}` on the input should keep the
+  // value at ≤64 chars, but pasted content can occasionally bypass that on
+  // some platforms. Surface a hint if it ever happens.
+  let serverTypeOverrideTooLong = $derived(serverTypeOverride.length > 64);
 
   // Original value snapshots for dirty-state tracking
   let originalTransport: TransportType = $state('stdio');
@@ -44,6 +68,7 @@
   let originalOauthServerUrl = $state('');
   let originalClientId = $state('');
   let originalScopes = $state('');
+  let originalServerTypeOverride = $state('');
 
   function snapshotOriginals() {
     originalTransport = transport;
@@ -58,6 +83,7 @@
     originalOauthServerUrl = oauthServerUrl;
     originalClientId = clientId;
     originalScopes = scopes;
+    originalServerTypeOverride = serverTypeOverride;
   }
 
   let prefixPreview = $derived(prefix ? `${prefix}__tool` : 'prefix__tool');
@@ -80,7 +106,8 @@
     oauthServerUrl !== originalOauthServerUrl ||
     clientId !== originalClientId ||
     clientSecretDirty ||
-    scopes !== originalScopes
+    scopes !== originalScopes ||
+    serverTypeOverride !== originalServerTypeOverride
   );
 
   $effect(() => {
@@ -132,6 +159,7 @@
         clientSecret = '';
         clientSecretSet = config.client_secret_set ?? false;
         scopes = config.scopes ?? '';
+        serverTypeOverride = config.server_type_override ?? '';
         snapshotOriginals();
       })
       .catch(() => {
@@ -212,6 +240,12 @@
         params.headers = headers;
       }
     }
+
+    // Always send the override field so an emptied input clears the stored
+    // value. The Rust handler skips writing on empty / absent. Sanitize so the
+    // value matches the relay's `sanitize_server_name` rules even if the user
+    // typed mixed-case or whitespace.
+    params.server_type_override = sanitizeName(serverTypeOverride);
 
     saving = true;
     try {
@@ -334,7 +368,8 @@
             <input id="config-ep-url" type="text" bind:value={url} placeholder="https://api.githubcopilot.com/mcp/"
               class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
           </div>
-          <details class="border border-(--border) rounded-lg">
+          <!-- Auto-expanded when a `server_type_override` is currently stored. -->
+          <details class="border border-(--border) rounded-lg" open={originalServerTypeOverride !== ''}>
             <summary class="px-3 py-2 text-xs font-medium text-(--fg2) cursor-pointer hover:bg-(--surface-hover) rounded-lg select-none">Advanced</summary>
             <div class="px-3 pb-3 space-y-3">
               <div>
@@ -358,6 +393,26 @@
                 <label for="config-ep-scopes" class="block text-xs font-medium mb-1 text-(--fg2)">Scopes <span class="text-(--fg2)/50">(space-separated)</span></label>
                 <input id="config-ep-scopes" type="text" bind:value={scopes} placeholder="repo read:user"
                   class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
+              </div>
+              <div>
+                <label for="config-ep-server-type-override" class="block text-xs font-medium mb-1 text-(--fg2)">Server type override <span class="text-(--fg2)/50">(optional)</span></label>
+                <input
+                  id="config-ep-server-type-override"
+                  type="text"
+                  bind:value={serverTypeOverride}
+                  placeholder="e.g. gmail"
+                  maxlength={64}
+                  class="w-full text-sm px-3 py-1.5 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) {serverTypeOverrideInvalid || serverTypeOverrideTooLong ? 'border-(--offline)' : 'border-(--border)'}" />
+                <p class="text-[11px] text-(--fg2) mt-0.5">Optional. Replaces the name this server reports to MCP clients. Useful when an upstream MCP server returns a placeholder like 'statelessserver'. Max 64 characters.</p>
+                {#if serverTypeOverridePreviewVisible}
+                  <p class="text-[11px] text-(--fg2) mt-0.5">Will be saved as: <code>{serverTypeOverrideSanitized}</code></p>
+                {/if}
+                {#if serverTypeOverrideInvalid}
+                  <p class="text-[11px] text-(--offline) mt-0.5">No usable characters — please include lowercase letters, digits, <code>-</code>, or <code>_</code>.</p>
+                {/if}
+                {#if serverTypeOverrideTooLong}
+                  <p class="text-[11px] text-(--offline) mt-0.5">Maximum 64 characters.</p>
+                {/if}
               </div>
             </div>
           </details>
@@ -429,6 +484,36 @@
               </div>
             {/each}
           </div>
+        {/if}
+
+        <!-- Generic Advanced section for non-OAuth transports. Auto-expanded
+             when a `server_type_override` is currently stored. -->
+        {#if transport !== 'oauth'}
+          <details class="border border-(--border) rounded-lg" open={originalServerTypeOverride !== ''}>
+            <summary class="px-3 py-2 text-xs font-medium text-(--fg2) cursor-pointer hover:bg-(--surface-hover) rounded-lg select-none">Advanced</summary>
+            <div class="px-3 pb-3 space-y-3">
+              <div>
+                <label for="config-ep-server-type-override-generic" class="block text-xs font-medium mb-1 text-(--fg2)">Server type override <span class="text-(--fg2)/50">(optional)</span></label>
+                <input
+                  id="config-ep-server-type-override-generic"
+                  type="text"
+                  bind:value={serverTypeOverride}
+                  placeholder="e.g. my-server"
+                  maxlength={64}
+                  class="w-full text-sm px-3 py-1.5 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) {serverTypeOverrideInvalid || serverTypeOverrideTooLong ? 'border-(--offline)' : 'border-(--border)'}" />
+                <p class="text-[11px] text-(--fg2) mt-0.5">Optional. Replaces the name this server reports to MCP clients. Useful when an upstream MCP server returns a placeholder like 'statelessserver'. Max 64 characters.</p>
+                {#if serverTypeOverridePreviewVisible}
+                  <p class="text-[11px] text-(--fg2) mt-0.5">Will be saved as: <code>{serverTypeOverrideSanitized}</code></p>
+                {/if}
+                {#if serverTypeOverrideInvalid}
+                  <p class="text-[11px] text-(--offline) mt-0.5">No usable characters — please include lowercase letters, digits, <code>-</code>, or <code>_</code>.</p>
+                {/if}
+                {#if serverTypeOverrideTooLong}
+                  <p class="text-[11px] text-(--offline) mt-0.5">Maximum 64 characters.</p>
+                {/if}
+              </div>
+            </div>
+          </details>
         {/if}
 
         {#if error}

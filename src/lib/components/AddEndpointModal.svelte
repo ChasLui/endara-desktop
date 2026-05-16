@@ -4,8 +4,19 @@
   import { toast } from 'svelte-sonner';
   import { CATALOG_SERVERS, type CatalogServer } from '$lib/catalog';
   import { oauthCatalog, type OAuthCatalogEntry } from '$lib/data/oauth-catalog';
-  import { buildScopesPayload, shouldShowManualOAuthStar } from './add-endpoint-helpers';
+  import {
+    buildScopesPayload,
+    shouldShowManualOAuthStar,
+    nextPollOrTimeout,
+    validateAddEndpointForm,
+    firstAddEndpointFieldError,
+    computeAddEndpointIsDirty,
+    type AddEndpointFieldErrors,
+    type AddEndpointFormSnapshot,
+  } from './add-endpoint-helpers';
   import { sanitizeName } from '$lib/utils';
+  import { focusTrap } from '$lib/actions/focusTrap';
+  import ConfirmModal from './ConfirmModal.svelte';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { open as dialogOpen } from '@tauri-apps/plugin-dialog';
 
@@ -33,6 +44,11 @@
   let userArgValues: string[] = $state([]);
   let submitting = $state(false);
   let error = $state('');
+  // Per-field validation errors set on submit; cleared per-field as the user
+  // edits the offending input. Drives `aria-invalid` and the red-border
+  // style on individual inputs while `error` keeps the bottom-of-form
+  // summary working.
+  let fieldErrors: AddEndpointFieldErrors = $state({});
   let testing = $state(false);
   let testResult: { success: boolean; toolCount?: number; error?: string } | null = $state(null);
   let oauthServerUrl = $state('');
@@ -76,6 +92,56 @@
   // value at ≤64 chars, but pasted content can occasionally bypass that on
   // some platforms. Surface a hint if it ever happens.
   let serverTypeOverrideTooLong = $derived(serverTypeOverride.length > 64);
+
+  // Captured at the moment `step` transitions to `'configure'` so any
+  // catalog pre-fills (name, command, args, etc.) become the dirty-check
+  // baseline. `null` while on the browse step — `isDirty` short-circuits
+  // to false in that case.
+  let originalSnapshot: AddEndpointFormSnapshot | null = $state(null);
+  // True iff the user has actually typed/changed something away from the
+  // snapshot in the configure step. Drives the "Discard changes?" prompt
+  // on Esc / backdrop click / Cancel.
+  let isDirty = $derived.by(() => {
+    if (step !== 'configure' || !originalSnapshot) return false;
+    return computeAddEndpointIsDirty(originalSnapshot, {
+      name,
+      command,
+      args,
+      url,
+      prefixCustom,
+      description,
+      envVars,
+      headerVars,
+      catalogEnvValues,
+      userArgValues,
+      oauthServerUrl,
+      clientId,
+      clientSecret,
+      scopes,
+      serverTypeOverride,
+    });
+  });
+  let showDiscardConfirm = $state(false);
+
+  function captureSnapshot(): AddEndpointFormSnapshot {
+    return {
+      name,
+      command,
+      args,
+      url,
+      prefixCustom,
+      description,
+      envVars: envVars.map((e) => ({ key: e.key, value: e.value })),
+      headerVars: headerVars.map((h) => ({ key: h.key, value: h.value })),
+      catalogEnvValues: { ...catalogEnvValues },
+      userArgValues: [...userArgValues],
+      oauthServerUrl,
+      clientId,
+      clientSecret,
+      scopes,
+      serverTypeOverride,
+    };
+  }
 
   let prefixPreview = $derived(prefix ? `${prefix}__tool` : 'prefix__tool');
 
@@ -163,6 +229,8 @@
     serverTypeOverride = service.serverTypeOverride ?? '';
     serverTypeOverrideHasDefault = Boolean(service.serverTypeOverride);
     error = '';
+    fieldErrors = {};
+    originalSnapshot = captureSnapshot();
     step = 'configure';
   }
 
@@ -189,6 +257,8 @@
     serverTypeOverride = server.serverTypeOverride ?? '';
     serverTypeOverrideHasDefault = Boolean(server.serverTypeOverride);
     error = '';
+    fieldErrors = {};
+    originalSnapshot = captureSnapshot();
     step = 'configure';
   }
 
@@ -216,14 +286,30 @@
     serverTypeOverride = '';
     serverTypeOverrideHasDefault = false;
     error = '';
+    fieldErrors = {};
+    originalSnapshot = captureSnapshot();
     step = 'configure';
   }
 
   function goBack() {
     step = 'browse';
     error = '';
+    fieldErrors = {};
     testResult = null;
     showingDcrFallback = false;
+    originalSnapshot = null;
+  }
+
+  /**
+   * Drop a single field's invalid flag in response to user input on that
+   * field. Keeps the rest of the per-field map intact and avoids re-running
+   * full-form validation on every keystroke.
+   */
+  function clearFieldError(field: keyof AddEndpointFieldErrors) {
+    if (fieldErrors[field]) {
+      const { [field]: _removed, ...rest } = fieldErrors;
+      fieldErrors = rest;
+    }
   }
 
   function handlePrefixInput(value: string) {
@@ -309,7 +395,12 @@
   async function handleSubmit() {
     error = '';
     cancelHint = '';
-    if (!name.trim()) { error = 'Name is required'; return; }
+    const errs = validateAddEndpointForm({ transport, name, command, url });
+    fieldErrors = errs;
+    if (Object.keys(errs).length > 0) {
+      error = firstAddEndpointFieldError(errs);
+      return;
+    }
     const trimmedName = name.trim();
     const defaultPrefix = sanitizeName(trimmedName);
 
@@ -327,7 +418,6 @@
     }
 
     if (transport === 'stdio') {
-      if (!command.trim()) { error = 'Command is required for stdio'; return; }
       params.command = command.trim();
 
       // Build args: base args + userArgs values
@@ -344,7 +434,6 @@
         params.args = finalArgs;
       }
     } else if (transport === 'oauth') {
-      if (!url.trim()) { error = 'Server URL is required'; return; }
       params.url = url.trim();
       if (oauthServerUrl.trim()) params.oauth_server_url = oauthServerUrl.trim();
       if (clientId.trim()) params.client_id = clientId.trim();
@@ -355,7 +444,6 @@
       );
       if (scopesPayload.string) params.scopes = scopesPayload.string;
     } else {
-      if (!url.trim()) { error = 'URL is required'; return; }
       params.url = url.trim();
     }
 
@@ -399,7 +487,9 @@
         const data = await getEndpoints();
         endpoints.set(data);
       } catch {
-        // Will be picked up by the next poll cycle
+        // Mutation already succeeded — silent on purpose. The 2s poll
+        // loop in +page.svelte reconciles the list; surfacing a refresh
+        // error on top of the success toast below would confuse users.
       }
       selectedEndpoint.set(name.trim());
       toast.success(`Server "${name.trim()}" added`);
@@ -415,8 +505,12 @@
     setupAuthCancelled = false;
     error = '';
     cancelHint = '';
-    if (!name.trim()) { error = 'Name is required'; return; }
-    if (!url.trim()) { error = 'Server URL is required'; return; }
+    const errs = validateAddEndpointForm({ transport: 'oauth', name, command, url });
+    fieldErrors = errs;
+    if (Object.keys(errs).length > 0) {
+      error = firstAddEndpointFieldError(errs);
+      return;
+    }
 
     const trimmedName = name.trim();
     const defaultPrefix = sanitizeName(trimmedName);
@@ -471,7 +565,7 @@
         // Open browser for authorization
         await openUrl(result.authorize_url);
 
-        // Poll for setup session completion (every 1s, up to 2 minutes)
+        // Poll for setup session completion (exponential backoff, ~120s budget)
         await pollForSetupAuth(result.session_id, trimmedName);
       }
     } catch (e) {
@@ -487,9 +581,16 @@
   }
 
   async function pollForSetupAuth(sessionId: string, endpointName: string) {
-    const maxAttempts = 120;
-    for (let i = 0; i < maxAttempts; i++) {
-      await new Promise((r) => setTimeout(r, 1000));
+    // Backoff schedule (1s → 2s → 4s → 5s cap) keyed to attempt index, with
+    // the cumulative-budget guard living in `nextPollOrTimeout`.
+    let attempt = 0;
+    let elapsedMs = 0;
+    while (true) {
+      const delayMs = nextPollOrTimeout(attempt, elapsedMs);
+      if (delayMs === null) break;
+      await new Promise((r) => setTimeout(r, delayMs));
+      elapsedMs += delayMs;
+      attempt += 1;
       if (setupAuthCancelled) return;
       try {
         const statusResult = await oauthSetupStatus(sessionId);
@@ -511,7 +612,9 @@
             const data = await getEndpoints();
             endpoints.set(data);
           } catch {
-            // Will be picked up by the next poll cycle
+            // OAuth commit already succeeded — silent on purpose. The
+            // 2s poll loop in +page.svelte reconciles the list; we
+            // don't want a refresh error on top of the success toast.
           }
           selectedEndpoint.set(endpointName);
           toast.success(`Connected to "${endpointName}"`);
@@ -577,13 +680,28 @@
     }
   }
 
-  async function handleCancel() {
+  // Unconditional close — cancels any pending OAuth setup session and
+  // closes the modal. Reached either directly (browse step / pristine
+  // configure step) or via the discard-changes confirm.
+  async function doCancel() {
     // Cancel pending setup session if user cancels — no config cleanup needed
     if (pendingSetupSessionId) {
       try { await oauthSetupCancel(pendingSetupSessionId); } catch { /* best effort */ }
       pendingSetupSessionId = null;
     }
     onclose();
+  }
+
+  // Guarded close — when the configure step has unsaved input, route to a
+  // nested ConfirmModal instead of dropping the user's work. The DCR
+  // fallback sub-dialog has its own cancel flow and is excluded so its
+  // own Escape/backdrop routing keeps working.
+  function handleCancel() {
+    if (step === 'configure' && isDirty && !showingDcrFallback) {
+      showDiscardConfirm = true;
+      return;
+    }
+    void doCancel();
   }
 
   async function handleDcrCancel() {
@@ -601,6 +719,8 @@
     cancelHint = 'OAuth setup cancelled — adjust your settings and try again.';
   }
 
+  // handleKeydown is still used by the (non-trapped) DCR sub-dialog backdrop
+  // below. The outer modal routes Escape via focusTrap's onEscape callback.
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
       if (showingDcrFallback) handleDcrCancel();
@@ -609,15 +729,14 @@
   }
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
-
-<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40" role="presentation" onclick={handleCancel} onkeydown={handleKeydown}>
+<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40" role="presentation" onclick={handleCancel}>
   <div
     class="bg-(--surface) rounded-xl shadow-xl border border-(--border) p-6 w-[36rem] max-w-[90vw] max-h-[90vh] overflow-y-auto"
     role="dialog"
     aria-modal="true"
     aria-label="Add Server"
     tabindex="-1"
+    use:focusTrap={{ onEscape: () => { if (showingDcrFallback) handleDcrCancel(); else handleCancel(); } }}
     onclick={(e) => e.stopPropagation()}
     onkeydown={(e) => e.stopPropagation()}
   >
@@ -775,7 +894,9 @@
         <div>
           <label for="modal-ep-name" class="block text-xs font-medium mb-1 text-(--fg2)">Name</label>
           <input id="modal-ep-name" type="text" bind:value={name} placeholder="my-server"
-            class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
+            aria-invalid={!!fieldErrors.name}
+            oninput={() => clearFieldError('name')}
+            class="w-full text-sm px-3 py-1.5 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) {fieldErrors.name ? 'border-(--offline)' : 'border-(--border)'}" />
         </div>
 
         <div>
@@ -814,7 +935,9 @@
           <div>
             <label for="modal-ep-cmd" class="block text-xs font-medium mb-1 text-(--fg2)">Command</label>
             <input id="modal-ep-cmd" type="text" bind:value={command} placeholder="npx"
-              class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
+              aria-invalid={!!fieldErrors.command}
+              oninput={() => clearFieldError('command')}
+              class="w-full text-sm px-3 py-1.5 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) {fieldErrors.command ? 'border-(--offline)' : 'border-(--border)'}" />
           </div>
           <div>
             <label for="modal-ep-args" class="block text-xs font-medium mb-1 text-(--fg2)">Arguments <span class="text-(--fg2)/50">(space-separated)</span></label>
@@ -825,7 +948,9 @@
           <div>
             <label for="modal-ep-url" class="block text-xs font-medium mb-1 text-(--fg2)">Server URL</label>
             <input id="modal-ep-url" type="text" bind:value={url} placeholder="https://mcp.linear.app/mcp"
-              class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
+              aria-invalid={!!fieldErrors.url}
+              oninput={() => clearFieldError('url')}
+              class="w-full text-sm px-3 py-1.5 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) {fieldErrors.url ? 'border-(--offline)' : 'border-(--border)'}" />
           </div>
 
           <!-- Curated scope checkbox list (only when the catalog entry exposes availableScopes) -->
@@ -924,7 +1049,9 @@
           <div>
             <label for="modal-ep-url" class="block text-xs font-medium mb-1 text-(--fg2)">URL</label>
             <input id="modal-ep-url" type="text" bind:value={url} placeholder={transport === 'sse' ? 'http://localhost:3000/sse' : 'http://localhost:3000/mcp'}
-              class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
+              aria-invalid={!!fieldErrors.url}
+              oninput={() => clearFieldError('url')}
+              class="w-full text-sm px-3 py-1.5 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) {fieldErrors.url ? 'border-(--offline)' : 'border-(--border)'}" />
           </div>
         {/if}
 
@@ -1120,7 +1247,10 @@
 
         {#if submitting && pendingSetupSessionId}
           <div class="flex items-center justify-between gap-2 pt-1">
-            <p class="text-[11px] text-(--fg2)">Waiting for browser authorization…</p>
+            <p class="text-[11px] text-(--fg2) flex items-center gap-2" aria-live="polite">
+              <span class="inline-block w-1.5 h-1.5 rounded-full bg-(--accent) animate-pulse-dot" aria-hidden="true"></span>
+              Waiting for browser authorization…
+            </p>
             <button
               type="button"
               class="text-xs text-(--accent) hover:text-(--accent-hover) underline"
@@ -1157,6 +1287,16 @@
     {/if}
   </div>
 </div>
+
+{#if showDiscardConfirm}
+  <ConfirmModal
+    title="Discard changes?"
+    message="You'll lose what you've typed."
+    confirmLabel="Discard"
+    onconfirm={() => { showDiscardConfirm = false; void doCancel(); }}
+    oncancel={() => { showDiscardConfirm = false; }}
+  />
+{/if}
 
 {#if showingDcrFallback}
   <div

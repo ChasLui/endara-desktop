@@ -2,7 +2,18 @@ import { describe, it, expect, vi } from 'vitest';
 import { sanitizeName } from '$lib/utils';
 import { CATALOG_SERVERS, type CatalogServer } from '$lib/catalog';
 import { oauthCatalog, type OAuthCatalogEntry } from '$lib/data/oauth-catalog';
-import { buildScopesPayload, shouldShowManualOAuthStar } from './add-endpoint-helpers';
+import {
+  buildScopesPayload,
+  shouldShowManualOAuthStar,
+  nextPollDelayMs,
+  nextPollOrTimeout,
+  OAUTH_SETUP_POLL_BUDGET_MS,
+  validateAddEndpointForm,
+  firstAddEndpointFieldError,
+  computeAddEndpointIsDirty,
+  type AddEndpointFieldErrors,
+  type AddEndpointFormSnapshot,
+} from './add-endpoint-helpers';
 
 // `sanitizeName` mirrors the relay's `sanitize_server_name`
 // (`packages/relay/src/adapter/server_name.rs`). The cases below stay in
@@ -480,6 +491,334 @@ describe('Scope option shape', () => {
         expect(opt.description.trim().length).toBeGreaterThan(0);
       }
     }
+  });
+});
+
+// Slice A row 3 — exponential backoff schedule (1s → 2s → 4s → 5s cap).
+describe('nextPollDelayMs', () => {
+  it('returns 1s, 2s, 4s, then caps at 5s for subsequent attempts', () => {
+    expect(nextPollDelayMs(0)).toBe(1000);
+    expect(nextPollDelayMs(1)).toBe(2000);
+    expect(nextPollDelayMs(2)).toBe(4000);
+    expect(nextPollDelayMs(3)).toBe(5000);
+    expect(nextPollDelayMs(4)).toBe(5000);
+    expect(nextPollDelayMs(10)).toBe(5000);
+    expect(nextPollDelayMs(100)).toBe(5000);
+  });
+
+  it('clamps negative inputs to the initial 1s delay', () => {
+    expect(nextPollDelayMs(-1)).toBe(1000);
+  });
+});
+
+// Slice A row 4 — cumulative-budget guard: polling stops once the next wait
+// would push us past the 120s window so `pollForSetupAuth` can surface a
+// timeout message instead of overshooting.
+describe('nextPollOrTimeout', () => {
+  it('returns the next delay while inside the budget', () => {
+    expect(nextPollOrTimeout(0, 0)).toBe(1000);
+    expect(nextPollOrTimeout(1, 1_000)).toBe(2000);
+    expect(nextPollOrTimeout(2, 3_000)).toBe(4000);
+    expect(nextPollOrTimeout(3, 7_000)).toBe(5000);
+  });
+
+  it('returns null when the next wait would exceed the 120s budget', () => {
+    expect(nextPollOrTimeout(99, OAUTH_SETUP_POLL_BUDGET_MS)).toBeNull();
+    expect(nextPollOrTimeout(99, OAUTH_SETUP_POLL_BUDGET_MS - 4_999)).toBeNull();
+    // Exactly fits — still allowed.
+    expect(nextPollOrTimeout(99, OAUTH_SETUP_POLL_BUDGET_MS - 5_000)).toBe(5000);
+  });
+
+  it('runs a bounded number of polls and stops within the 120s budget', () => {
+    // Simulates the loop in `pollForSetupAuth` and verifies it terminates
+    // with a timeout rather than overshooting the wall-clock budget.
+    let attempt = 0;
+    let elapsed = 0;
+    const delays: number[] = [];
+    while (true) {
+      const next = nextPollOrTimeout(attempt, elapsed);
+      if (next === null) break;
+      delays.push(next);
+      elapsed += next;
+      attempt += 1;
+      // Guard against an accidental infinite loop in the test.
+      if (attempt > 1000) throw new Error('schedule did not terminate');
+    }
+    expect(delays.slice(0, 4)).toEqual([1000, 2000, 4000, 5000]);
+    expect(elapsed).toBeLessThanOrEqual(OAUTH_SETUP_POLL_BUDGET_MS);
+    // 1+2+4+5 = 12s, then 5s steps → 12 + 5*N ≤ 120  →  N ≤ 21  →  25 polls total.
+    expect(delays.length).toBe(25);
+    // The very next attempt after the loop terminates must be flagged as a timeout.
+    expect(nextPollOrTimeout(attempt, elapsed)).toBeNull();
+  });
+});
+
+// Slice C row 13 — per-field validation in AddEndpointModal: required fields
+// flag `aria-invalid` on submit and clear back to false once the user edits
+// the offending input. The pure helpers below back the in-component logic;
+// the on-edit clear is mirrored by `clearFieldError` in the modal.
+describe('validateAddEndpointForm', () => {
+  it('flags only `name` when stdio command is filled but name is empty', () => {
+    const errs = validateAddEndpointForm({
+      transport: 'stdio',
+      name: '   ',
+      command: 'npx',
+      url: '',
+    });
+    expect(errs).toEqual({ name: 'Name is required' });
+  });
+
+  it('flags only `command` for stdio when name is filled but command is empty', () => {
+    const errs = validateAddEndpointForm({
+      transport: 'stdio',
+      name: 'my-server',
+      command: '',
+      url: '',
+    });
+    expect(errs).toEqual({ command: 'Command is required for stdio' });
+  });
+
+  it('flags both `name` and `command` for stdio when both are blank', () => {
+    const errs = validateAddEndpointForm({
+      transport: 'stdio',
+      name: '',
+      command: '',
+      url: '',
+    });
+    expect(errs).toEqual({
+      name: 'Name is required',
+      command: 'Command is required for stdio',
+    });
+  });
+
+  it('flags `url` with the OAuth-specific message for the oauth transport', () => {
+    const errs = validateAddEndpointForm({
+      transport: 'oauth',
+      name: 'linear',
+      command: '',
+      url: '',
+    });
+    expect(errs).toEqual({ url: 'Server URL is required' });
+  });
+
+  it('flags `url` with the generic message for sse/http transports', () => {
+    for (const t of ['sse', 'http'] as const) {
+      const errs = validateAddEndpointForm({ transport: t, name: 'srv', command: '', url: '' });
+      expect(errs).toEqual({ url: 'URL is required' });
+    }
+  });
+
+  it('does not require a command for non-stdio transports', () => {
+    const errs = validateAddEndpointForm({
+      transport: 'sse',
+      name: 'srv',
+      command: '',
+      url: 'http://localhost:3000/sse',
+    });
+    expect(errs).toEqual({});
+  });
+
+  it('returns an empty object for a fully valid stdio form', () => {
+    const errs = validateAddEndpointForm({
+      transport: 'stdio',
+      name: 'echo',
+      command: 'npx',
+      url: '',
+    });
+    expect(errs).toEqual({});
+  });
+
+  it('treats whitespace-only inputs as missing for required fields', () => {
+    const errs = validateAddEndpointForm({
+      transport: 'oauth',
+      name: '   \t  ',
+      command: '',
+      url: '   ',
+    });
+    expect(errs).toEqual({
+      name: 'Name is required',
+      url: 'Server URL is required',
+    });
+    // `command` only appears when explicitly set; ensure it isn't a real key.
+    expect(Object.prototype.hasOwnProperty.call(errs, 'command')).toBe(false);
+  });
+});
+
+describe('firstAddEndpointFieldError', () => {
+  it('returns the empty string when the map is empty', () => {
+    expect(firstAddEndpointFieldError({})).toBe('');
+  });
+
+  it('prefers `name` over `command` over `url`', () => {
+    expect(
+      firstAddEndpointFieldError({ name: 'a', command: 'b', url: 'c' }),
+    ).toBe('a');
+    expect(firstAddEndpointFieldError({ command: 'b', url: 'c' })).toBe('b');
+    expect(firstAddEndpointFieldError({ url: 'c' })).toBe('c');
+  });
+});
+
+describe('per-field clear-on-edit (mirror of clearFieldError)', () => {
+  // Same contract as `clearFieldError` in AddEndpointModal.svelte: dropping a
+  // single key from `fieldErrors` is what flips `aria-invalid` on the
+  // matching input back to `false` while leaving the rest of the map intact.
+  function clearFieldError(
+    state: { fieldErrors: AddEndpointFieldErrors },
+    field: keyof AddEndpointFieldErrors,
+  ) {
+    if (state.fieldErrors[field]) {
+      const { [field]: _removed, ...rest } = state.fieldErrors;
+      state.fieldErrors = rest;
+    }
+  }
+
+  it('removes only the edited field and leaves the rest intact', () => {
+    const state = {
+      fieldErrors: {
+        name: 'Name is required',
+        command: 'Command is required for stdio',
+      } as AddEndpointFieldErrors,
+    };
+    clearFieldError(state, 'name');
+    expect(state.fieldErrors).toEqual({ command: 'Command is required for stdio' });
+    expect(Object.prototype.hasOwnProperty.call(state.fieldErrors, 'name')).toBe(false);
+  });
+
+  it('is a no-op when the field was not flagged', () => {
+    const state = {
+      fieldErrors: { url: 'URL is required' } as AddEndpointFieldErrors,
+    };
+    const before = state.fieldErrors;
+    clearFieldError(state, 'name');
+    expect(state.fieldErrors).toBe(before);
+  });
+
+  it('clearing the only flagged field empties the map (aria-invalid → false)', () => {
+    const state = { fieldErrors: { url: 'URL is required' } as AddEndpointFieldErrors };
+    clearFieldError(state, 'url');
+    expect(state.fieldErrors).toEqual({});
+  });
+});
+
+// Slice D1 — `computeAddEndpointIsDirty` drives the "Discard changes?"
+// prompt in AddEndpointModal. The snapshot is captured at the moment
+// `step` transitions to `'configure'` (catalog pre-fills included), so
+// the dirty check is purely a deep-equal of the snapshot vs the current
+// editable fields. The tests below pin every comparison branch.
+describe('computeAddEndpointIsDirty', () => {
+  function makeSnapshot(overrides: Partial<AddEndpointFormSnapshot> = {}): AddEndpointFormSnapshot {
+    return {
+      name: '',
+      command: '',
+      args: '',
+      url: '',
+      prefixCustom: false,
+      description: '',
+      envVars: [],
+      headerVars: [],
+      catalogEnvValues: {},
+      userArgValues: [],
+      oauthServerUrl: '',
+      clientId: '',
+      clientSecret: '',
+      scopes: '',
+      serverTypeOverride: '',
+      ...overrides,
+    };
+  }
+
+  it('returns false when current matches snapshot exactly', () => {
+    const snap = makeSnapshot();
+    expect(computeAddEndpointIsDirty(snap, makeSnapshot())).toBe(false);
+  });
+
+  it('returns false against a catalog-prefilled baseline that is unchanged', () => {
+    const snap = makeSnapshot({
+      name: 'GitHub',
+      command: 'npx',
+      args: '-y @modelcontextprotocol/server-github',
+      description: 'Code hosting and collaboration',
+    });
+    expect(computeAddEndpointIsDirty(snap, { ...snap })).toBe(false);
+  });
+
+  it('flags each top-level string field independently', () => {
+    const snap = makeSnapshot();
+    const cases: (keyof AddEndpointFormSnapshot)[] = [
+      'name',
+      'command',
+      'args',
+      'url',
+      'description',
+      'oauthServerUrl',
+      'clientId',
+      'clientSecret',
+      'scopes',
+      'serverTypeOverride',
+    ];
+    for (const key of cases) {
+      const current = { ...snap, [key]: 'x' } as AddEndpointFormSnapshot;
+      expect(computeAddEndpointIsDirty(snap, current)).toBe(true);
+    }
+  });
+
+  it('flags prefixCustom toggling from false to true', () => {
+    const snap = makeSnapshot();
+    expect(computeAddEndpointIsDirty(snap, makeSnapshot({ prefixCustom: true }))).toBe(true);
+  });
+
+  it('flags envVars/headerVars when entries are added, even with empty key/value', () => {
+    const snap = makeSnapshot();
+    expect(
+      computeAddEndpointIsDirty(snap, makeSnapshot({ envVars: [{ key: '', value: '' }] })),
+    ).toBe(true);
+    expect(
+      computeAddEndpointIsDirty(snap, makeSnapshot({ headerVars: [{ key: '', value: '' }] })),
+    ).toBe(true);
+  });
+
+  it('flags envVars/headerVars when an existing entry is edited', () => {
+    const snap = makeSnapshot({ envVars: [{ key: 'TOKEN', value: '' }] });
+    const current = makeSnapshot({ envVars: [{ key: 'TOKEN', value: 'ghp_123' }] });
+    expect(computeAddEndpointIsDirty(snap, current)).toBe(true);
+  });
+
+  it('returns false when envVars match element-for-element', () => {
+    const snap = makeSnapshot({
+      envVars: [{ key: 'A', value: '1' }, { key: 'B', value: '2' }],
+    });
+    const current = makeSnapshot({
+      envVars: [{ key: 'A', value: '1' }, { key: 'B', value: '2' }],
+    });
+    expect(computeAddEndpointIsDirty(snap, current)).toBe(false);
+  });
+
+  it('flags catalogEnvValues when the user fills a prefilled key', () => {
+    // Catalog seeds the form with `catalogEnvValues: {}`; the GITHUB_TOKEN
+    // input writes back into the same record via two-way binding.
+    const snap = makeSnapshot();
+    const current = makeSnapshot({ catalogEnvValues: { GITHUB_TOKEN: 'ghp_123' } });
+    expect(computeAddEndpointIsDirty(snap, current)).toBe(true);
+  });
+
+  it('flags userArgValues when an entry is edited', () => {
+    // Catalog seeds `userArgValues` with empty strings — one per declared
+    // userArg slot — and the Browse… button writes the chosen path back.
+    const snap = makeSnapshot({ userArgValues: ['', ''] });
+    const current = makeSnapshot({ userArgValues: ['/tmp/path', ''] });
+    expect(computeAddEndpointIsDirty(snap, current)).toBe(true);
+  });
+
+  it('returns false when userArgValues match element-for-element', () => {
+    const snap = makeSnapshot({ userArgValues: ['/tmp', '/var'] });
+    const current = makeSnapshot({ userArgValues: ['/tmp', '/var'] });
+    expect(computeAddEndpointIsDirty(snap, current)).toBe(false);
+  });
+
+  it('flags userArgValues when the length differs', () => {
+    const snap = makeSnapshot({ userArgValues: [''] });
+    const current = makeSnapshot({ userArgValues: ['', ''] });
+    expect(computeAddEndpointIsDirty(snap, current)).toBe(true);
   });
 });
 

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { selectedEndpointData, activeTab, selectedEndpoint, endpoints } from '$lib/stores';
+  import { requestNavigation } from '$lib/stores/unsavedChangesGuard';
   import { restartEndpoint, refreshEndpoint, removeEndpoint, getEndpoints, disableEndpoint, enableEndpoint } from '$lib/api';
   import { toast } from 'svelte-sonner';
   import ToolsTab from './ToolsTab.svelte';
@@ -68,7 +69,11 @@
       try {
         const data = await getEndpoints();
         endpoints.set(data);
-      } catch { /* will be picked up by next poll */ }
+      } catch {
+        // Mutation already succeeded — silent on purpose. The 2s poll
+        // loop in +page.svelte reconciles the list; surfacing a refresh
+        // error on top of the success toast below would confuse users.
+      }
       toast.success(`Server "${ep.name}" ${ep.disabled ? 'enabled' : 'disabled'}`);
     } catch {
       toast.error(`Failed to ${action} "${ep.name}"`);
@@ -85,7 +90,11 @@
         try {
           const data = await getEndpoints();
           endpoints.set(data);
-        } catch { /* will be picked up by next poll */ }
+        } catch {
+          // Mutation already succeeded — silent on purpose. The 2s poll
+          // loop in +page.svelte reconciles the list; surfacing a refresh
+          // error on top of the success toast below would confuse users.
+        }
         toast.success(`Server "${name}" deleted`);
       } catch {
         toast.error(`Failed to delete "${name}"`);
@@ -119,20 +128,22 @@
           class="tgl {ep.disabled ? 'tgl-off' : ''} {toggling ? 'opacity-50' : ''}"
           onclick={handleToggle}
           disabled={toggling}
+          role="switch"
+          aria-checked={!ep.disabled}
           title={ep.disabled ? 'Enable server' : 'Disable server'}
           aria-label={ep.disabled ? 'Enable server' : 'Disable server'}
         ><span></span></button>
         {#if shouldShowRefreshButton(!!ep.disabled)}
-          <button class="btn-sec" onclick={handleRefresh}>Refresh</button>
+          <button class="btn-sec btn-sm" onclick={handleRefresh}>Refresh</button>
         {/if}
         {#if shouldShowRestartButton(ep.transport, !!ep.disabled)}
           <button
-            class="btn-sec btn-danger"
+            class="btn-sec btn-sm btn-danger"
             onclick={() => showRestartConfirm = true}
             title={ep.transport === 'stdio' ? 'Kill and restart the server process' : 'Reconnect the SSE event stream'}
           >{ep.transport === 'stdio' ? 'Restart' : 'Reconnect'}</button>
         {/if}
-        <button class="btn-sec btn-danger" onclick={() => showDeleteConfirm = true}>Delete</button>
+        <button class="btn-sec btn-sm btn-danger" onclick={() => showDeleteConfirm = true}>Delete</button>
       </div>
     </div>
 
@@ -152,7 +163,10 @@
       {#each tabs as tab}
         <button
           class="dtab {$activeTab === tab.id ? 'active' : ''}"
-          onclick={() => activeTab.set(tab.id)}
+          onclick={() => {
+            if ($activeTab === tab.id) return;
+            requestNavigation(() => activeTab.set(tab.id));
+          }}
         >{tab.label}</button>
       {/each}
     </div>
@@ -193,6 +207,7 @@
       <div class="text-center">
         <div class="text-4xl mb-3 text-(--fg3)"><svg class="inline-block w-10 h-10" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2L5 11h5l-1.5 7L15 9h-5l1.5-7z"/></svg></div>
         <div class="text-sm">Select an endpoint to view details</div>
+        <div class="text-xs mt-1">or add a new server with the + button above</div>
       </div>
     </div>
   {/if}
@@ -243,31 +258,6 @@
   }
   .tgl:disabled {
     cursor: not-allowed;
-  }
-
-  /* Secondary button */
-  .btn-sec {
-    padding: 4px 10px;
-    font-size: 11px;
-    line-height: 1.4;
-    font-weight: 500;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: transparent;
-    color: var(--fg1);
-    cursor: pointer;
-    font-family: inherit;
-    transition: background-color 150ms var(--ease), color 150ms var(--ease);
-  }
-  .btn-sec:hover {
-    background: var(--hover-bg);
-  }
-  .btn-danger {
-    border-color: color-mix(in oklab, var(--offline) 35%, transparent);
-    color: var(--offline);
-  }
-  .btn-danger:hover {
-    background: color-mix(in oklab, var(--offline) 8%, transparent);
   }
 
   /* Detail tabs */

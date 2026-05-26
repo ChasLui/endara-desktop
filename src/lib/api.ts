@@ -392,3 +392,67 @@ export async function oauthSetupCancel(sessionId: string): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------
+
+export interface ProfileSummary {
+  name: string;
+  path: string;
+  endpoints: string[];
+  /** Per-profile JS-execution toggle. Always a concrete boolean. */
+  js_execution: boolean;
+  /** Per-profile TOON output toggle. Always a concrete boolean. */
+  toon_output: boolean;
+  endpoint_count: number;
+  tool_count: number;
+}
+
+export interface ProfileDetail extends ProfileSummary {
+  /** Full catalog scoped to the profile's endpoints. */
+  tools: Tool[];
+}
+
+export interface CreateProfileParams {
+  name: string;
+  path: string;
+  endpoints: string[];
+  /** Required; relay rejects requests that omit it. */
+  js_execution: boolean;
+  /** Required; relay rejects requests that omit it. */
+  toon_output: boolean;
+}
+
+export type UpdateProfileParams = CreateProfileParams;
+
+export async function listProfiles(): Promise<ProfileSummary[]> {
+  return fetchJson<ProfileSummary[]>('/profiles');
+}
+
+export async function getProfile(path: string): Promise<ProfileDetail> {
+  return fetchJson<ProfileDetail>(`/profiles/${encodeURIComponent(path)}`);
+}
+
+export async function createProfile(params: CreateProfileParams): Promise<ProfileSummary> {
+  return fetchJson<ProfileSummary>('/profiles', { method: 'POST', body: params });
+}
+
+export async function updateProfile(
+  path: string,
+  params: UpdateProfileParams,
+): Promise<ProfileSummary> {
+  return fetchJson<ProfileSummary>(`/profiles/${encodeURIComponent(path)}`, {
+    method: 'PUT',
+    body: params,
+  });
+}
+
+export async function deleteProfile(path: string): Promise<void> {
+  await fetchJson(`/profiles/${encodeURIComponent(path)}`, { method: 'DELETE' });
+}
+
+export async function getEndpointProfiles(name: string): Promise<{ profiles: string[] }> {
+  return fetchJson<{ profiles: string[] }>(
+    `/endpoints/${encodeURIComponent(name)}/profiles`,
+  );
+}

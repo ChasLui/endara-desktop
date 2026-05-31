@@ -1,4 +1,6 @@
 mod api_proxy;
+mod overlay;
+mod sse;
 mod tray;
 mod webview_recovery;
 
@@ -9,9 +11,9 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, Manager, RunEvent, State,
+    AppHandle, Emitter, Manager, RunEvent, State, Window,
 };
 use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_notification::NotificationExt;
@@ -1425,6 +1427,258 @@ async fn get_mgmt_api_socket_path() -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn show_overlay(app: AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window(overlay::OVERLAY_WINDOW_LABEL) {
+        w.show().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn hide_overlay(app: AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window(overlay::OVERLAY_WINDOW_LABEL) {
+        w.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_overlay_ignore_cursor_events(app: AppHandle, ignore: bool) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window(overlay::OVERLAY_WINDOW_LABEL) {
+        w.set_ignore_cursor_events(ignore)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn reposition_overlay(app: AppHandle, position: String) -> Result<(), String> {
+    let pos = overlay::OverlayPosition::parse(&position)?;
+    overlay::reposition_overlay_window(&app, pos).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn subscribe_tool_call_events(
+    window: Window,
+    state: State<'_, overlay::OverlaySubscriberState>,
+) -> Result<(), String> {
+    let socket = api_proxy::resolve_api_socket_path(&data_dir()?);
+    overlay::spawn_sse_bridge(&state, socket, window).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn unsubscribe_tool_call_events(
+    state: State<'_, overlay::OverlaySubscriberState>,
+) -> Result<(), String> {
+    overlay::abort_sse_bridge(&state).await;
+    Ok(())
+}
+
+/// Read `[desktop.overlay]` from `config.toml`, falling back to defaults if
+/// the file is missing, malformed, or the section is absent. Used by the
+/// Settings UI and the tray menu to display the current state without
+/// triggering the migration helper (which only runs once at startup).
+fn read_overlay_settings_from_config() -> overlay::OverlaySettings {
+    let Ok(table) = read_config() else {
+        return overlay::OverlaySettings::default();
+    };
+    let Some(overlay_table) = table
+        .get("desktop")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("overlay"))
+        .and_then(|v| v.as_table())
+    else {
+        return overlay::OverlaySettings::default();
+    };
+    toml::Value::Table(overlay_table.clone())
+        .try_into::<overlay::OverlaySettings>()
+        .unwrap_or_default()
+        .sanitize()
+}
+
+/// Persist `settings` into `[desktop.overlay]`, creating the `[desktop]`
+/// table if missing. Sibling keys under `[desktop]` (e.g. `update_channel`)
+/// are preserved.
+fn write_overlay_settings_to_config(settings: &overlay::OverlaySettings) -> Result<(), String> {
+    let mut table = read_config().unwrap_or_else(|_| toml::Table::new());
+    let desktop = table
+        .entry("desktop")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or("Invalid [desktop] section in config")?;
+    let overlay_value =
+        toml::Value::try_from(settings).map_err(|e| format!("serialize overlay settings: {e}"))?;
+    desktop.insert("overlay".to_string(), overlay_value);
+    write_config(&table)
+}
+
+#[tauri::command]
+async fn get_overlay_settings() -> Result<overlay::OverlaySettings, String> {
+    Ok(read_overlay_settings_from_config())
+}
+
+/// App-managed handle to the tray menu's "Show MCP activity overlay" check
+/// item. Wrapping the `CheckMenuItem` in a newtype lets `apply_overlay_settings`
+/// look it up via [`Manager::try_state`] and keep the checkbox in sync
+/// without round-tripping through an event-bus listener. The clone stored
+/// here is cheap — Tauri's `CheckMenuItem` is internally `Arc`-wrapped.
+struct TrayOverlayToggle(CheckMenuItem<tauri::Wry>);
+
+/// Desired checked state for the tray's "Show MCP activity overlay" menu
+/// item given a set of `OverlaySettings`. Factored out so the contract
+/// ("tray.checked mirrors `settings.enabled`") is unit-testable independently
+/// of the Tauri runtime, and so the initial tray-menu construction and the
+/// `apply_overlay_settings` sync path can share a single source of truth.
+fn tray_overlay_checked_for(settings: &overlay::OverlaySettings) -> bool {
+    settings.enabled
+}
+
+/// Persist `new_settings` and apply the runtime delta against `prev`:
+///
+///   * `enabled` toggled on  → build a fresh overlay window (its renderer
+///     auto-subscribes to the SSE bridge on mount, so no manual subscribe).
+///   * `enabled` toggled off → abort the SSE bridge AND destroy the overlay
+///     window so its renderer unmounts cleanly.
+///   * `position` changed (still enabled) → call `reposition_overlay_window`.
+///   * Always `emit_to(OVERLAY_WINDOW_LABEL, "overlay:settings-changed", …)`
+///     so the overlay renderer's `overlaySettingsStore` and toast store opts
+///     (`auto_dismiss_ms`, `max_visible`, `show_profile`) stay in sync
+///     without a window rebuild. Window-scoped so the main window is not
+///     spuriously notified.
+///   * Sync the tray menu's "Show MCP activity overlay" checkbox directly
+///     via [`TrayOverlayToggle`] state (no event round-trip) so the tray
+///     UI stays consistent when the Settings UI flips `enabled`.
+///
+/// Shared by the `set_overlay_settings` Tauri command and the tray-menu
+/// "Show MCP activity overlay" toggle so both surfaces stay consistent.
+async fn apply_overlay_settings(
+    app: &AppHandle,
+    state: &overlay::OverlaySubscriberState,
+    prev: &overlay::OverlaySettings,
+    new_settings: &overlay::OverlaySettings,
+) -> Result<(), String> {
+    write_overlay_settings_to_config(new_settings)?;
+
+    let enabled_changed = prev.enabled != new_settings.enabled;
+    let position_changed = prev.position != new_settings.position;
+
+    if enabled_changed && !new_settings.enabled {
+        // Disable: tear down SSE bridge first so the renderer is not racing
+        // a final frame against window destruction, then destroy the
+        // window. `destroy()` bypasses the `prevent_close` guard in the
+        // app-level window event handler.
+        overlay::abort_sse_bridge(state).await;
+        if let Some(w) = app.get_webview_window(overlay::OVERLAY_WINDOW_LABEL) {
+            if let Err(e) = w.destroy() {
+                log::warn!("[overlay] destroy on disable failed: {e}");
+            }
+        }
+        log::info!("[overlay] settings update enabled=false applied");
+    } else if enabled_changed && new_settings.enabled {
+        // Enable: rebuild the overlay window. The renderer auto-invokes
+        // `subscribe_tool_call_events` on mount, which spawns a fresh SSE
+        // bridge task.
+        match overlay::build_overlay_window(app, new_settings) {
+            Ok(_) => log::info!(
+                "[overlay] settings update enabled=true position={} applied",
+                new_settings.position.as_str()
+            ),
+            Err(e) => {
+                log::warn!("[overlay] failed to build overlay window on enable error={e}");
+                return Err(format!("failed to build overlay window: {e}"));
+            }
+        }
+    } else if position_changed && new_settings.enabled {
+        if let Err(e) = overlay::reposition_overlay_window(app, new_settings.position) {
+            log::warn!("[overlay] reposition failed: {e}");
+        }
+    }
+
+    // Notify the overlay renderer (if mounted) so its store + opts mirror
+    // the new settings. Scoped to the overlay window via `emit_to` so the
+    // main window is not spuriously notified. Safe to call even when the
+    // overlay window is gone — Tauri swallows the emit for a missing
+    // target label rather than erroring on it.
+    if let Err(e) = app.emit_to(
+        overlay::OVERLAY_WINDOW_LABEL,
+        "overlay:settings-changed",
+        new_settings,
+    ) {
+        log::warn!("[overlay] settings-changed emit_to failed: {e}");
+    }
+
+    // Keep the tray "Show MCP activity overlay" checkbox in sync. Both
+    // callers (the `set_overlay_settings` Tauri command and the tray
+    // toggle handler) flow through here, so this is the single place tray
+    // state has to track. `try_state` is `None` during early init / tests
+    // that don't register the toggle — silently skip in that case.
+    if let Some(toggle) = app.try_state::<TrayOverlayToggle>() {
+        if let Err(e) = toggle.0.set_checked(tray_overlay_checked_for(new_settings)) {
+            log::warn!("[overlay] tray set_checked failed: {e}");
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_overlay_settings(
+    app: AppHandle,
+    state: State<'_, overlay::OverlaySubscriberState>,
+    settings: overlay::OverlaySettings,
+) -> Result<(), String> {
+    let new_settings = settings.sanitize();
+    let prev = read_overlay_settings_from_config();
+    apply_overlay_settings(&app, &state, &prev, &new_settings).await
+}
+
+/// Payload emitted to the main window so its RelayLogs view can scroll the
+/// matching `request{id="..."}` row into view. Field name is camelCase to
+/// match the renderer event handler — Tauri serializes Serde structs with
+/// the default rename, and the front-end consumer expects `jsonrpcId`.
+#[derive(Serialize, Clone)]
+struct FocusLogPayload {
+    #[serde(rename = "jsonrpcId")]
+    jsonrpc_id: String,
+}
+
+/// Show + focus the main window and emit `overlay:focus-log` to it with the
+/// JSON-RPC id of the request the user clicked on in the overlay. The Phase
+/// 4 overlay card click handler is wired through here; Phase 3 ships the
+/// plumbing only.
+///
+/// On macOS we also restore the regular activation policy so the app
+/// reappears in the Dock + Cmd-Tab when the user clicks from an otherwise
+/// hidden / accessory-mode session — mirroring the tray "Open Endara"
+/// behaviour.
+#[tauri::command]
+async fn focus_main_window_on_log(app: AppHandle, jsonrpc_id: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    set_macos_activation_policy(true);
+    if let Some(window) = app.get_webview_window("main") {
+        window.show().map_err(|e| e.to_string())?;
+        window.unminimize().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+        window
+            .emit(
+                "overlay:focus-log",
+                FocusLogPayload {
+                    jsonrpc_id: jsonrpc_id.clone(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        log::info!(
+            "[overlay] focus_main_window_on_log emitted jsonrpc_id={}",
+            jsonrpc_id
+        );
+        Ok(())
+    } else {
+        Err("main window not available".to_string())
+    }
+}
+
+#[tauri::command]
 async fn set_relay_port(port: u16, state: State<'_, RelayState>) -> Result<(), String> {
     *state.port.lock().await = port;
 
@@ -1995,6 +2249,15 @@ fn set_tray_health(app: AppHandle, state: &str, detail: Option<String>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Capture `config.toml` existence BEFORE any code path (read_config,
+    // read_port_from_config, the relay sidecar spawn) has had a chance to
+    // touch the file. The overlay migration helper in Phase 5 uses this to
+    // distinguish a fresh install (file did not exist → overlay defaults to
+    // enabled) from an upgrading install (file existed → overlay defaults to
+    // disabled). Falls back to `false` (fresh-install semantics) when
+    // `config_path()` cannot be resolved.
+    let overlay_file_existed_before = config_path().map(|p| p.exists()).unwrap_or(false);
+
     let default_port = if is_dev_mode() {
         DEV_RELAY_PORT
     } else {
@@ -2060,6 +2323,7 @@ pub fn run() {
         .manage(relay_state)
         .manage(pending_update)
         .manage(UpdaterBackoffState::default())
+        .manage(overlay::OverlaySubscriberState::default())
         .invoke_handler(tauri::generate_handler![
             start_relay,
             stop_relay,
@@ -2087,6 +2351,15 @@ pub fn run() {
             get_autostart,
             set_autostart,
             set_tray_health,
+            show_overlay,
+            hide_overlay,
+            set_overlay_ignore_cursor_events,
+            reposition_overlay,
+            subscribe_tool_call_events,
+            unsubscribe_tool_call_events,
+            get_overlay_settings,
+            set_overlay_settings,
+            focus_main_window_on_log,
         ])
         .setup(move |app| {
             log::info!(
@@ -2098,16 +2371,67 @@ pub fn run() {
                 dev
             );
 
+            // Resolve the overlay's persisted settings BEFORE building the
+            // tray menu so the "Show MCP activity overlay" checkbox starts
+            // in the right state. `overlay_file_existed_before` was
+            // captured at the very top of `run()` before any other code
+            // path could touch `config.toml`.
+            let overlay_cfg = match config_path() {
+                Ok(cfg_path) => overlay::ensure_overlay_default(
+                    &cfg_path,
+                    overlay_file_existed_before,
+                )
+                .unwrap_or_else(|e| {
+                    log::warn!("[overlay] migration helper failed error={e}; using defaults");
+                    overlay::OverlaySettings::default()
+                }),
+                Err(e) => {
+                    log::warn!("[overlay] config_path unresolved error={e}; using defaults");
+                    overlay::OverlaySettings::default()
+                }
+            };
+            log::info!(
+                "[overlay] resolved settings enabled={} position={} auto_dismiss_ms={} max_visible={} show_profile={}",
+                overlay_cfg.enabled,
+                overlay_cfg.position.as_str(),
+                overlay_cfg.auto_dismiss_ms,
+                overlay_cfg.max_visible,
+                overlay_cfg.show_profile,
+            );
+
             // Build tray menu
             let status_item =
                 MenuItem::with_id(app, "status", "Endara — Running", false, None::<&str>)?;
             let open_item = MenuItem::with_id(app, "open", "Open Endara", true, None::<&str>)?;
+            let overlay_toggle_item = CheckMenuItem::with_id(
+                app,
+                "toggle_overlay",
+                "Show MCP activity overlay",
+                true,
+                tray_overlay_checked_for(&overlay_cfg),
+                None::<&str>,
+            )?;
             let update_item =
                 MenuItem::with_id(app, "check_update", "Check for Updates", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
-            let menu =
-                Menu::with_items(app, &[&status_item, &open_item, &update_item, &quit_item])?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &status_item,
+                    &open_item,
+                    &overlay_toggle_item,
+                    &update_item,
+                    &quit_item,
+                ],
+            )?;
+
+            // Register the tray toggle as managed state so
+            // `apply_overlay_settings` can update its checked state directly
+            // without an event-bus round-trip. Both the Settings UI command
+            // path and the tray-click path call `apply_overlay_settings`,
+            // so this single registration keeps both surfaces in sync.
+            app.manage(TrayOverlayToggle(overlay_toggle_item.clone()));
 
             // Stash the status menu item as managed state so `set_tray_health`
             // can update its label when the frontend reports a new health
@@ -2135,6 +2459,34 @@ pub fn run() {
                             let _ = window.show();
                             let _ = window.set_focus();
                         }
+                    }
+                    "toggle_overlay" => {
+                        // Flip `enabled` against the current persisted value
+                        // and route through `apply_overlay_settings` so the
+                        // tray and Settings UI take the same code path.
+                        let prev = read_overlay_settings_from_config();
+                        let next = overlay::OverlaySettings {
+                            enabled: !prev.enabled,
+                            ..prev.clone()
+                        };
+                        log::info!(
+                            "tray menu action=toggle_overlay from={} to={}",
+                            prev.enabled,
+                            next.enabled
+                        );
+                        let app_handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state =
+                                app_handle.state::<overlay::OverlaySubscriberState>();
+                            if let Err(e) =
+                                apply_overlay_settings(&app_handle, &state, &prev, &next).await
+                            {
+                                log::warn!(
+                                    "[overlay] tray toggle apply failed error={}",
+                                    e
+                                );
+                            }
+                        });
                     }
                     "check_update" => {
                         log::info!("tray menu action=check_update");
@@ -2228,6 +2580,16 @@ pub fn run() {
                 log::warn!("[webview] main window missing at setup; crash-recovery not installed");
             }
 
+            if overlay_cfg.enabled {
+                match overlay::build_overlay_window(app.handle(), &overlay_cfg) {
+                    Ok(_) => log::info!(
+                        "[overlay] window built label=overlay position={}",
+                        overlay_cfg.position.as_str()
+                    ),
+                    Err(e) => log::warn!("[overlay] failed to build overlay window error={e}"),
+                }
+            }
+
             // Handle autostarted launch: hide window and set accessory mode
             if is_autostarted() {
                 log::info!("autostart hide window=main accessory_mode=true");
@@ -2250,6 +2612,18 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // The overlay window is owned by the app lifecycle (toggled
+                // via the Settings tray); close-requested on it (e.g. via
+                // dev-tools) is a no-op rather than the "hide main + drop
+                // activation policy" path the main window uses.
+                if window.label() == overlay::OVERLAY_WINDOW_LABEL {
+                    log::info!(
+                        "window close requested label={} action=prevented",
+                        window.label()
+                    );
+                    api.prevent_close();
+                    return;
+                }
                 log::info!(
                     "window close requested label={} action=prevented_and_hidden",
                     window.label()
@@ -3423,5 +3797,61 @@ mod tray_label_tests {
             compose_tray_tooltip("degraded", Some("2 endpoints unhealthy")),
             "Endara Relay — 2 endpoints unhealthy"
         );
+    }
+}
+
+#[cfg(test)]
+mod tray_overlay_toggle_tests {
+    //! Locks in the contract that the tray "Show MCP activity overlay"
+    //! checkbox tracks [`overlay::OverlaySettings::enabled`] across both
+    //! the Settings UI invoke path (`set_overlay_settings` → `apply_overlay_settings`)
+    //! and the tray-click path (the "toggle_overlay" handler in `setup` →
+    //! `apply_overlay_settings`). Both call sites use
+    //! [`tray_overlay_checked_for`] to derive the checked state, so testing
+    //! the helper covers both paths.
+
+    use super::*;
+
+    #[test]
+    fn tray_checked_when_settings_enabled() {
+        let s = overlay::OverlaySettings {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(tray_overlay_checked_for(&s));
+    }
+
+    #[test]
+    fn tray_unchecked_when_settings_disabled() {
+        let s = overlay::OverlaySettings {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(!tray_overlay_checked_for(&s));
+    }
+
+    #[test]
+    fn tray_checked_ignores_non_enabled_fields() {
+        // Non-enabled settings fields (position, dismiss window, max visible,
+        // show_profile) must not influence the tray check state.
+        let base = overlay::OverlaySettings {
+            enabled: true,
+            ..Default::default()
+        };
+        let position_variant = overlay::OverlaySettings {
+            position: overlay::OverlayPosition::TopLeft,
+            ..base.clone()
+        };
+        let dismiss_variant = overlay::OverlaySettings {
+            auto_dismiss_ms: overlay::AUTO_DISMISS_MS_MAX,
+            ..base.clone()
+        };
+        let show_profile_variant = overlay::OverlaySettings {
+            show_profile: false,
+            ..base.clone()
+        };
+        assert!(tray_overlay_checked_for(&position_variant));
+        assert!(tray_overlay_checked_for(&dismiss_variant));
+        assert!(tray_overlay_checked_for(&show_profile_variant));
     }
 }

@@ -11,8 +11,17 @@ import {
   validateAddEndpointForm,
   firstAddEndpointFieldError,
   computeAddEndpointIsDirty,
+  resolveIsolation,
+  isolationEnabledFromConfig,
+  parseMountRows,
+  serializeMountRows,
+  mountRowError,
+  hasMountRowErrors,
+  buildMountExample,
+  MOUNT_EXAMPLE_FALLBACK_HOST,
   type AddEndpointFieldErrors,
   type AddEndpointFormSnapshot,
+  type MountRow,
 } from './add-endpoint-helpers';
 
 // `sanitizeName` mirrors the relay's `sanitize_server_name`
@@ -723,6 +732,8 @@ describe('computeAddEndpointIsDirty', () => {
       clientSecret: '',
       scopes: '',
       serverTypeOverride: '',
+      isolationEnabled: true,
+      mounts: [],
       ...overrides,
     };
   }
@@ -819,6 +830,187 @@ describe('computeAddEndpointIsDirty', () => {
     const snap = makeSnapshot({ userArgValues: [''] });
     const current = makeSnapshot({ userArgValues: ['', ''] });
     expect(computeAddEndpointIsDirty(snap, current)).toBe(true);
+  });
+
+  it('flags the isolation toggle when flipped away from the snapshot', () => {
+    const snap = makeSnapshot();
+    expect(computeAddEndpointIsDirty(snap, makeSnapshot({ isolationEnabled: false }))).toBe(true);
+    expect(computeAddEndpointIsDirty(snap, makeSnapshot({ isolationEnabled: true }))).toBe(false);
+  });
+
+  it('flags mount rows when added, edited, or removed', () => {
+    const snap = makeSnapshot();
+    expect(
+      computeAddEndpointIsDirty(snap, makeSnapshot({ mounts: [{ host: '', container: '' }] })),
+    ).toBe(true);
+    const withMount = makeSnapshot({ mounts: [{ host: '/a', container: '/b' }] });
+    expect(
+      computeAddEndpointIsDirty(withMount, makeSnapshot({ mounts: [{ host: '/a', container: '/c' }] })),
+    ).toBe(true);
+    expect(computeAddEndpointIsDirty(withMount, makeSnapshot({ mounts: [] }))).toBe(true);
+  });
+
+  it('returns false when mount rows match element-for-element', () => {
+    const snap = makeSnapshot({ mounts: [{ host: '/a', container: '/b' }] });
+    const current = makeSnapshot({ mounts: [{ host: '/a', container: '/b' }] });
+    expect(computeAddEndpointIsDirty(snap, current)).toBe(false);
+  });
+});
+
+// Volume-mount editor helpers — parse stored `mounts: string[]` into rows,
+// validate the two-input host/container pairs, and serialize back to the
+// relay's `host:container` array form.
+describe('mount row helpers', () => {
+  it('parseMountRows splits each entry on its first colon and trims', () => {
+    expect(parseMountRows(['~/.gmail-mcp:/home/node/.gmail-mcp'])).toEqual([
+      { host: '~/.gmail-mcp', container: '/home/node/.gmail-mcp' },
+    ]);
+    expect(parseMountRows(['  /host  :  /container  '])).toEqual([
+      { host: '/host', container: '/container' },
+    ]);
+  });
+
+  it('parseMountRows yields a host-only row for an entry with no colon', () => {
+    expect(parseMountRows(['/host-only'])).toEqual([{ host: '/host-only', container: '' }]);
+  });
+
+  it('parseMountRows treats only the first colon as the separator', () => {
+    expect(parseMountRows(['/a:/b:/c'])).toEqual([{ host: '/a', container: '/b:/c' }]);
+  });
+
+  it('parseMountRows returns [] for undefined/empty input', () => {
+    expect(parseMountRows(undefined)).toEqual([]);
+    expect(parseMountRows([])).toEqual([]);
+  });
+
+  it('mountRowError accepts a valid pair and a fully-empty row', () => {
+    expect(mountRowError({ host: '/a', container: '/b' })).toBeNull();
+    expect(mountRowError({ host: '  ', container: '' })).toBeNull();
+  });
+
+  it('mountRowError flags a missing host or container', () => {
+    expect(mountRowError({ host: '', container: '/b' })).toBe('Host path is required');
+    expect(mountRowError({ host: '/a', container: '' })).toBe('Container path is required');
+  });
+
+  it('mountRowError rejects a colon inside either half', () => {
+    expect(mountRowError({ host: '/a:/x', container: '/b' })).toBe('Paths must not contain ":"');
+    expect(mountRowError({ host: '/a', container: '/b:ro' })).toBe('Paths must not contain ":"');
+  });
+
+  it('hasMountRowErrors is true when any row is malformed', () => {
+    expect(hasMountRowErrors([{ host: '/a', container: '/b' }, { host: '', container: '' }])).toBe(false);
+    expect(hasMountRowErrors([{ host: '/a', container: '' }])).toBe(true);
+  });
+
+  it('serializeMountRows trims, skips empty rows, and joins with a colon', () => {
+    const rows: MountRow[] = [
+      { host: '  /host  ', container: '  /container  ' },
+      { host: '', container: '' },
+      { host: '~/.gmail-mcp', container: '/home/node/.gmail-mcp' },
+    ];
+    expect(serializeMountRows(rows)).toEqual([
+      '/host:/container',
+      '~/.gmail-mcp:/home/node/.gmail-mcp',
+    ]);
+  });
+
+  it('serializeMountRows round-trips through parseMountRows', () => {
+    const serialized = ['~/.gmail-mcp:/home/node/.gmail-mcp', '/data:/srv/data'];
+    expect(serializeMountRows(parseMountRows(serialized))).toEqual(serialized);
+  });
+});
+
+// buildMountExample — the host side must be a valid absolute docker arg
+// (docker rejects `~/...`); the container side is always the generic
+// `/home/node/example`, and a failed home-dir lookup falls back to an
+// absolute placeholder path.
+describe('buildMountExample', () => {
+  it('uses the resolved home directory on the host side', () => {
+    expect(buildMountExample('/Users/alex')).toBe('/Users/alex/example:/home/node/example');
+  });
+
+  it('strips a trailing slash from the home directory', () => {
+    expect(buildMountExample('/home/alex/')).toBe('/home/alex/example:/home/node/example');
+  });
+
+  it('falls back to an absolute placeholder when home is null/blank', () => {
+    expect(buildMountExample(null)).toBe(`${MOUNT_EXAMPLE_FALLBACK_HOST}:/home/node/example`);
+    expect(buildMountExample(undefined)).toBe(`${MOUNT_EXAMPLE_FALLBACK_HOST}:/home/node/example`);
+    expect(buildMountExample('   ')).toBe(`${MOUNT_EXAMPLE_FALLBACK_HOST}:/home/node/example`);
+  });
+
+  it('never produces a `~`-prefixed or product-specific example', () => {
+    const example = buildMountExample('/Users/alex');
+    expect(example).not.toContain('~');
+    expect(example.toLowerCase()).not.toContain('gmail');
+    expect(MOUNT_EXAMPLE_FALLBACK_HOST.startsWith('/')).toBe(true);
+  });
+});
+
+// Isolation defaults — stdio endpoints always send an explicit value
+// ("container"/"none", never omitted) because the relay treats an absent
+// field as direct spawn. Flagged catalog entries force "none".
+describe('resolveIsolation', () => {
+  it('returns "container" for stdio when containerizable and toggle is on (default)', () => {
+    expect(resolveIsolation('stdio', true, true)).toBe('container');
+  });
+
+  it('returns "none" for stdio when the user turns the toggle off', () => {
+    expect(resolveIsolation('stdio', true, false)).toBe('none');
+  });
+
+  it('returns "none" for flagged catalog entries regardless of the toggle', () => {
+    expect(resolveIsolation('stdio', false, true)).toBe('none');
+    expect(resolveIsolation('stdio', false, false)).toBe('none');
+  });
+
+  it('returns undefined for non-stdio transports', () => {
+    for (const t of ['sse', 'http', 'oauth'] as const) {
+      expect(resolveIsolation(t, true, true)).toBeUndefined();
+      expect(resolveIsolation(t, false, false)).toBeUndefined();
+    }
+  });
+});
+
+// Config-tab seeding — maps the stored isolation value to the toggle state.
+// Only an explicit "container" reads ON; "none"/empty/absent all mean direct
+// spawn (the relay's default for an omitted field).
+describe('isolationEnabledFromConfig', () => {
+  it('returns true only for an explicit "container"', () => {
+    expect(isolationEnabledFromConfig('container')).toBe(true);
+  });
+
+  it('returns false for "none"', () => {
+    expect(isolationEnabledFromConfig('none')).toBe(false);
+  });
+
+  it('returns false for empty/absent values (direct-spawn default)', () => {
+    expect(isolationEnabledFromConfig('')).toBe(false);
+    expect(isolationEnabledFromConfig(undefined)).toBe(false);
+  });
+
+  it('returns false for unrecognized values', () => {
+    expect(isolationEnabledFromConfig('CONTAINER')).toBe(false);
+    expect(isolationEnabledFromConfig('docker')).toBe(false);
+  });
+});
+
+describe('catalog containerizable flags', () => {
+  it('exactly Filesystem, Puppeteer, and Memory are flagged not-containerizable', () => {
+    const flagged = CATALOG_SERVERS.filter((s) => s.containerizable === false)
+      .map((s) => s.id)
+      .sort();
+    expect(flagged).toEqual(['filesystem', 'memory', 'puppeteer']);
+  });
+
+  it('every flagged entry carries a non-empty containerNote reason', () => {
+    for (const s of CATALOG_SERVERS) {
+      if (s.containerizable === false) {
+        expect(s.containerNote, `${s.id}: missing containerNote`).toBeTruthy();
+        expect(s.containerNote!.trim().length).toBeGreaterThan(0);
+      }
+    }
   });
 });
 

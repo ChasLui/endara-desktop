@@ -5,6 +5,37 @@ export interface RelayStatus {
   uptime_seconds: number;
   endpoint_count: number;
   healthy_count: number;
+  /**
+   * Whether the relay detected a usable container runtime (Docker/Podman)
+   * on the host. Optional — older relays omit it, so only an explicit
+   * `false` should drive the "no runtime" notice in the Add Server flow.
+   */
+  container_runtime_available?: boolean;
+}
+
+/**
+ * Live resource usage polled from the container runtime for a containerized
+ * stdio endpoint. Mirrors the relay's `container_stats` management-API field.
+ */
+export interface ContainerStats {
+  cpu_percent: number;
+  mem_bytes: number;
+  net_rx_bytes: number;
+  net_tx_bytes: number;
+}
+
+/**
+ * Isolation status reported by the relay for stdio endpoints. `configured`
+ * is what `config.toml` asked for; `actual` is what the relay actually did
+ * (it falls back to a direct spawn when no container runtime is usable).
+ * Absent for non-stdio endpoints and for older relays that predate the field.
+ */
+export interface IsolationState {
+  configured: 'container' | 'none';
+  actual: 'container' | 'direct';
+  runtime?: 'docker' | 'podman';
+  container_name?: string;
+  image?: string;
 }
 
 // Lifecycle state from the management API (GET /api/endpoints)
@@ -45,6 +76,17 @@ export interface Endpoint {
   disabled: boolean;
   error?: string;
   lifecycle?: Lifecycle;
+  /**
+   * Present only for containerized stdio endpoints; absent/null for
+   * direct-spawn endpoints. Updated by the relay's stats poller and picked
+   * up by the desktop's 2s endpoint poll loop.
+   */
+  container_stats?: ContainerStats | null;
+  /**
+   * Present only for stdio endpoints on relays that report it; absent for
+   * non-stdio endpoints and older relays.
+   */
+  isolation_state?: IsolationState | null;
 }
 
 export interface Tool {

@@ -140,6 +140,18 @@ export interface AddEndpointParams {
    * digits, `-`, `_` only — empty/absent leaves the field unset.
    */
   server_type_override?: string;
+  /**
+   * Isolation mode for stdio endpoints. The desktop always sends an explicit
+   * value when creating a stdio endpoint — `"container"` or `"none"`, never
+   * omitted — because the relay treats an absent field as direct spawn.
+   */
+  isolation?: 'container' | 'none';
+  /**
+   * Bind mounts for containerized stdio endpoints. Each entry is a verbatim
+   * docker `-v` `"host_path:container_path"` pair (relative host paths are
+   * resolved by the relay). Omitted when empty.
+   */
+  mounts?: string[];
 }
 
 /**
@@ -252,6 +264,16 @@ export interface EndpointConfig {
    * `server_type_override`. Absent when no override is configured.
    */
   server_type_override?: string;
+  /**
+   * Isolation mode stored for stdio endpoints (`"container"` or `"none"`).
+   * Absent for legacy endpoints that never set it (= direct spawn).
+   */
+  isolation?: string;
+  /**
+   * Bind mounts stored for containerized stdio endpoints, as verbatim docker
+   * `-v` `"host_path:container_path"` pairs. Absent when none are configured.
+   */
+  mounts?: string[];
 }
 
 export async function getEndpointConfig(name: string): Promise<EndpointConfig> {
@@ -285,6 +307,20 @@ export interface UpdateEndpointParams {
    * string clears the override; absent leaves the stored value unchanged.
    */
   server_type_override?: string;
+  /**
+   * Isolation mode for stdio endpoints. The relay's PUT handler rebuilds the
+   * whole endpoint config from the request body, so updates must pass the
+   * stored value through or a containerized endpoint silently reverts to
+   * direct spawn on save.
+   */
+  isolation?: string;
+  /**
+   * Bind mounts for containerized stdio endpoints, as verbatim docker `-v`
+   * `"host_path:container_path"` pairs. The relay's PUT rebuilds the whole
+   * endpoint config from the body, so the desktop always sends an explicit
+   * array (possibly empty, to clear) for stdio endpoints.
+   */
+  mounts?: string[];
 }
 
 export async function startOAuth(name: string): Promise<OAuthStartResult> {

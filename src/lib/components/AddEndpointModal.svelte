@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { addEndpoint, getEndpoints, testConnection, oauthSetup, oauthSetupStatus, oauthSetupCredentials, oauthSetupCommit, oauthSetupCancel, reloadConfig, type AddEndpointParams, type TestConnectionParams, type OAuthSetupParams } from '$lib/api';
+  import { addEndpoint, getEndpoints, getStatus, testConnection, oauthSetup, oauthSetupStatus, oauthSetupCredentials, oauthSetupCommit, oauthSetupCancel, reloadConfig, type AddEndpointParams, type TestConnectionParams, type OAuthSetupParams } from '$lib/api';
   import { endpoints, selectedEndpoint } from '$lib/stores';
   import { toast } from 'svelte-sonner';
   import { CATALOG_SERVERS, type CatalogServer } from '$lib/catalog';
@@ -11,14 +11,21 @@
     validateAddEndpointForm,
     firstAddEndpointFieldError,
     computeAddEndpointIsDirty,
+    resolveIsolation,
+    serializeMountRows,
+    mountRowError,
+    hasMountRowErrors,
+    buildMountExample,
     type AddEndpointFieldErrors,
     type AddEndpointFormSnapshot,
+    type MountRow,
   } from './add-endpoint-helpers';
   import { sanitizeName } from '$lib/utils';
   import { focusTrap } from '$lib/actions/focusTrap';
   import ConfirmModal from './ConfirmModal.svelte';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { open as dialogOpen } from '@tauri-apps/plugin-dialog';
+  import { homeDir } from '@tauri-apps/api/path';
 
   type TransportType = 'stdio' | 'sse' | 'http' | 'oauth';
   type Step = 'browse' | 'configure';
@@ -92,6 +99,35 @@
   // value at ≤64 chars, but pasted content can occasionally bypass that on
   // some platforms. Surface a hint if it ever happens.
   let serverTypeOverrideTooLong = $derived(serverTypeOverride.length > 64);
+  // Isolation toggle for stdio endpoints — default ON so new endpoints
+  // containerize by default. The submit path always sends an explicit
+  // "container"/"none" value (see resolveIsolation).
+  let isolationEnabled = $state(true);
+  // True when the active catalog entry is flagged not-containerizable —
+  // the toggle is replaced by a "Not containerized" notice and the endpoint
+  // is created with isolation = "none".
+  let catalogNotContainerizable = $derived.by(() => selectedCatalog?.containerizable === false);
+  // Volume mounts (stdio + container isolation only) — host/container path
+  // pairs sent as the relay's `mounts: string[]`. Mirrors the env-var editor.
+  let mountRows: MountRow[] = $state([]);
+  // The mount section is only meaningful when the endpoint will actually run
+  // in a container — i.e. stdio, isolation ON, and not a flagged catalog entry.
+  let showMounts = $derived(transport === 'stdio' && isolationEnabled && !catalogNotContainerizable);
+  // Resolved user home directory, used to build a valid absolute-path mount
+  // example. Left null until Tauri resolves it (or on failure), so the
+  // example falls back to a generic absolute path.
+  let homeDirPath: string | null = $state(null);
+  homeDir()
+    .then((h) => { homeDirPath = h; })
+    .catch(() => { /* leave null — buildMountExample falls back */ });
+  let mountExample = $derived(buildMountExample(homeDirPath));
+  // null = unknown (older relay or status fetch failed); only an explicit
+  // `false` from the relay drives the "no runtime" inline notice.
+  let containerRuntimeAvailable: boolean | null = $state(null);
+  let runtimeMissing = $derived(containerRuntimeAvailable === false);
+  getStatus()
+    .then((s) => { containerRuntimeAvailable = s.container_runtime_available ?? null; })
+    .catch(() => { /* relay unreachable — leave runtime availability unknown */ });
 
   // Captured at the moment `step` transitions to `'configure'` so any
   // catalog pre-fills (name, command, args, etc.) become the dirty-check
@@ -119,6 +155,8 @@
       clientSecret,
       scopes,
       serverTypeOverride,
+      isolationEnabled,
+      mounts: mountRows,
     });
   });
   let showDiscardConfirm = $state(false);
@@ -140,6 +178,8 @@
       clientSecret,
       scopes,
       serverTypeOverride,
+      isolationEnabled,
+      mounts: mountRows.map((m) => ({ host: m.host, container: m.container })),
     };
   }
 
@@ -228,6 +268,8 @@
     dcrClientSecret = '';
     serverTypeOverride = service.serverTypeOverride ?? '';
     serverTypeOverrideHasDefault = Boolean(service.serverTypeOverride);
+    isolationEnabled = true;
+    mountRows = [];
     error = '';
     fieldErrors = {};
     originalSnapshot = captureSnapshot();
@@ -256,6 +298,8 @@
     showingDcrFallback = false;
     serverTypeOverride = server.serverTypeOverride ?? '';
     serverTypeOverrideHasDefault = Boolean(server.serverTypeOverride);
+    isolationEnabled = true;
+    mountRows = [];
     error = '';
     fieldErrors = {};
     originalSnapshot = captureSnapshot();
@@ -285,6 +329,8 @@
     showingDcrFallback = false;
     serverTypeOverride = '';
     serverTypeOverrideHasDefault = false;
+    isolationEnabled = true;
+    mountRows = [];
     error = '';
     fieldErrors = {};
     originalSnapshot = captureSnapshot();
@@ -432,6 +478,27 @@
       }
       if (finalArgs.length > 0) {
         params.args = finalArgs;
+      }
+
+      // Always explicit for stdio — the relay treats an omitted field as
+      // direct spawn, so "container"/"none" is never left implicit.
+      params.isolation = resolveIsolation(
+        transport,
+        !catalogNotContainerizable,
+        isolationEnabled,
+      );
+
+      // Volume mounts only apply to containerized stdio endpoints. Block on
+      // any malformed row, then send the serialized array (omitted when empty).
+      if (params.isolation === 'container') {
+        if (hasMountRowErrors(mountRows)) {
+          error = 'Fix the highlighted volume mount rows before continuing.';
+          return;
+        }
+        const mounts = serializeMountRows(mountRows);
+        if (mounts.length > 0) {
+          params.mounts = mounts;
+        }
       }
     } else if (transport === 'oauth') {
       params.url = url.trim();
@@ -826,6 +893,14 @@
                     API Key
                   </span>
                 {/if}
+                {#if server.containerizable === false}
+                  <span
+                    class="inline-block text-[10px] px-1.5 py-0.5 rounded-full bg-(--surface-hover) text-(--fg2) border border-(--border) font-medium"
+                    title={server.containerNote}
+                  >
+                    Not containerized
+                  </span>
+                {/if}
               </div>
             </button>
           {/if}
@@ -944,6 +1019,44 @@
             <input id="modal-ep-args" type="text" bind:value={args} placeholder="-y @modelcontextprotocol/server-filesystem /tmp"
               class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
           </div>
+
+          <!-- Isolation setting (stdio only). Flagged catalog entries can't
+               containerize — show the badge + reason instead of the toggle. -->
+          {#if catalogNotContainerizable}
+            <div class="flex items-start gap-2 px-3 py-2 rounded-lg border border-(--border) bg-(--surface-hover)">
+              <span class="inline-block text-[10px] px-1.5 py-0.5 rounded-full bg-(--surface) text-(--fg2) border border-(--border) font-medium flex-shrink-0">
+                Not containerized
+              </span>
+              <p class="text-[11px] text-(--fg2)">
+                {selectedCatalog?.containerNote} This server runs directly on your machine.
+              </p>
+            </div>
+          {:else}
+            <div>
+              <div class="flex items-center justify-between gap-2">
+                <label for="modal-ep-isolation" class="text-xs font-medium text-(--fg2)">
+                  Run in container <span class="text-(--fg2)/50">(isolation)</span>
+                </label>
+                <button
+                  id="modal-ep-isolation"
+                  type="button"
+                  class="tgl {isolationEnabled ? '' : 'tgl-off'}"
+                  role="switch"
+                  aria-checked={isolationEnabled}
+                  title={isolationEnabled ? 'Disable container isolation' : 'Enable container isolation'}
+                  onclick={() => isolationEnabled = !isolationEnabled}
+                ><span></span></button>
+              </div>
+              <p class="text-[11px] text-(--fg2) mt-0.5">
+                Runs the server in an isolated container (Docker or Podman) instead of directly on your machine.
+              </p>
+              {#if runtimeMissing && isolationEnabled}
+                <p class="text-[11px] text-(--attention) mt-1">
+                  No container runtime detected — the server will fall back to running directly on your machine. Install Docker or Podman to enable isolation.
+                </p>
+              {/if}
+            </div>
+          {/if}
         {:else if transport === 'oauth'}
           <div>
             <label for="modal-ep-url" class="block text-xs font-medium mb-1 text-(--fg2)">Server URL</label>
@@ -1140,6 +1253,49 @@
             </div>
           {/each}
         </div>
+
+        <!-- Volume mounts (containerized stdio only) — host/container bind
+             pairs sent to the relay as `mounts: string[]`. -->
+        {#if showMounts}
+          <div>
+            <div class="flex items-center justify-between mb-1">
+              <span class="block text-xs font-medium text-(--fg2)">
+                Volume mounts
+                <span class="text-(--fg2)/50">(optional)</span>
+              </span>
+              <button
+                type="button"
+                class="text-xs text-(--accent) hover:text-(--accent-hover)"
+                onclick={() => mountRows = [...mountRows, { host: '', container: '' }]}
+              >
+                + Add
+              </button>
+            </div>
+            {#each mountRows as mount, i}
+              {@const rowError = mountRowError(mount)}
+              <div class="flex gap-1 mb-1">
+                <input type="text" bind:value={mount.host} placeholder="/host/path"
+                  aria-invalid={!!rowError}
+                  class="flex-1 text-sm px-2 py-1 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) font-mono {rowError ? 'border-(--offline)' : 'border-(--border)'}" />
+                <span class="self-center text-xs text-(--fg2)">:</span>
+                <input type="text" bind:value={mount.container} placeholder="/container/path"
+                  aria-invalid={!!rowError}
+                  class="flex-1 text-sm px-2 py-1 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) font-mono {rowError ? 'border-(--offline)' : 'border-(--border)'}" />
+                <button
+                  type="button"
+                  class="text-xs px-1.5 text-(--fg2) hover:text-(--offline)"
+                  onclick={() => mountRows = mountRows.filter((_, idx) => idx !== i)}
+                >✕</button>
+              </div>
+              {#if rowError}
+                <p class="text-[11px] text-(--offline) mb-1">{rowError}</p>
+              {/if}
+            {/each}
+            <p class="text-[11px] text-(--fg2) mt-0.5">
+              Bind host paths into the container, e.g. <code>{mountExample}</code>.
+            </p>
+          </div>
+        {/if}
 
         <!-- Custom HTTP headers (SSE/HTTP only) -->
         {#if transport !== 'stdio'}
@@ -1385,4 +1541,38 @@
     </div>
   </div>
 {/if}
+
+<style>
+  /* Toggle pill (36x20) — mirrors the enable/disable switch in DetailPanel */
+  .tgl {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    border-radius: 999px;
+    background: var(--healthy);
+    border: 0;
+    cursor: pointer;
+    padding: 0;
+    flex-shrink: 0;
+    transition: background-color 150ms var(--ease);
+  }
+  .tgl.tgl-off {
+    background: var(--toggle-off);
+  }
+  .tgl > span {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: 999px;
+    background: #fff;
+    box-shadow: 0 1px 2px var(--scrim);
+    transition: transform 150ms var(--ease);
+  }
+  .tgl:not(.tgl-off) > span {
+    transform: translateX(16px);
+  }
+</style>
+
 

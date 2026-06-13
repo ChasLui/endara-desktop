@@ -87,6 +87,133 @@ export function nextPollOrTimeout(
 export type AddEndpointTransport = 'stdio' | 'sse' | 'http' | 'oauth';
 
 /**
+ * Resolves the explicit `isolation` value sent when creating an endpoint.
+ *
+ * Stdio endpoints ALWAYS get an explicit value — `"container"` or `"none"`,
+ * never omitted — because the relay treats an absent field as direct spawn
+ * and we want new endpoints to containerize by default. Catalog entries
+ * flagged `containerizable: false` force `"none"` regardless of the toggle.
+ * Non-stdio transports return `undefined` (the field does not apply).
+ */
+export function resolveIsolation(
+  transport: AddEndpointTransport,
+  containerizable: boolean,
+  isolationEnabled: boolean,
+): 'container' | 'none' | undefined {
+  if (transport !== 'stdio') return undefined;
+  if (!containerizable) return 'none';
+  return isolationEnabled ? 'container' : 'none';
+}
+
+/**
+ * Maps a stored endpoint `isolation` value to the toggle's on/off state.
+ *
+ * Only an explicit `"container"` means containerized; `"none"`, an empty
+ * string, or an absent field all mean direct spawn (the relay's default for
+ * an omitted field), so the toggle reads OFF for those.
+ */
+export function isolationEnabledFromConfig(isolation: string | undefined): boolean {
+  return isolation === 'container';
+}
+
+/**
+ * A single editable volume-mount row in the Add/Config mount editors. Mirrors
+ * the env-var `{ key, value }` shape: two separate inputs whose `:`-joined
+ * form is the verbatim docker `-v` bind-mount string the relay stores in the
+ * stdio config's `mounts` array.
+ */
+export interface MountRow {
+  host: string;
+  container: string;
+}
+
+/**
+ * Seeds the mount editor from a stored `mounts: string[]` array. Each entry is
+ * split on its first `:` into host/container halves (trimmed); an entry with
+ * no `:` becomes a host-only row so the user can finish it. Absent/empty input
+ * yields no rows.
+ */
+export function parseMountRows(mounts: string[] | undefined): MountRow[] {
+  if (!mounts) return [];
+  return mounts.map((entry) => {
+    const idx = entry.indexOf(':');
+    if (idx === -1) return { host: entry.trim(), container: '' };
+    return { host: entry.slice(0, idx).trim(), container: entry.slice(idx + 1).trim() };
+  });
+}
+
+/**
+ * Validates a single mount row. Returns an inline error message, or `null`
+ * when the row is OK (including a fully-empty row, which is skipped on
+ * submit). Enforces a single `:` separator with non-empty host and container
+ * parts — since the two halves are separate inputs, a literal `:` in either
+ * one would produce a malformed `host:container` string, so it is rejected.
+ */
+export function mountRowError(row: MountRow): string | null {
+  const host = row.host.trim();
+  const container = row.container.trim();
+  if (!host && !container) return null;
+  if (!host) return 'Host path is required';
+  if (!container) return 'Container path is required';
+  if (host.includes(':') || container.includes(':')) {
+    return 'Paths must not contain ":"';
+  }
+  return null;
+}
+
+/** True when any row fails {@link mountRowError}. Blocks submit. */
+export function hasMountRowErrors(rows: MountRow[]): boolean {
+  return rows.some((row) => mountRowError(row) !== null);
+}
+
+/**
+ * Serializes mount rows into the relay's `mounts: string[]` form. Trims each
+ * half, skips fully-empty rows, and joins the rest as `host:container`.
+ * Callers should gate submit on {@link hasMountRowErrors} first; this does no
+ * validation of its own.
+ */
+export function serializeMountRows(rows: MountRow[]): string[] {
+  const out: string[] = [];
+  for (const row of rows) {
+    const host = row.host.trim();
+    const container = row.container.trim();
+    if (!host && !container) continue;
+    out.push(`${host}:${container}`);
+  }
+  return out;
+}
+
+/**
+ * Host-side fallback for the volume-mount example when the user's home
+ * directory can't be resolved (e.g. the Tauri `homeDir()` call fails). Must
+ * be an absolute path — docker rejects `~/...` as an invalid local volume
+ * name and requires an absolute host path.
+ */
+export const MOUNT_EXAMPLE_FALLBACK_HOST = '/path/to/example';
+
+/**
+ * Builds the `host:container` example string shown under the volume-mount
+ * editor. The host side uses the resolved home directory (e.g.
+ * `/Users/alex/example`) so it is a valid absolute docker arg; the container
+ * side is always the generic `/home/node/example`. When `home` is absent or
+ * blank, the host side falls back to {@link MOUNT_EXAMPLE_FALLBACK_HOST}.
+ */
+export function buildMountExample(home: string | null | undefined): string {
+  const trimmed = typeof home === 'string' ? home.trim() : '';
+  const host = trimmed ? `${trimmed.replace(/\/+$/, '')}/example` : MOUNT_EXAMPLE_FALLBACK_HOST;
+  return `${host}:/home/node/example`;
+}
+
+/** Structural equality for mount-row lists, used by the dirty check. */
+function sameMountList(a: MountRow[], b: MountRow[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].host !== b[i].host || a[i].container !== b[i].container) return false;
+  }
+  return true;
+}
+
+/**
  * Per-field error map for inputs that surface `aria-invalid` in the Add
  * Server modal. Presence of a key means that field failed validation; the
  * value is the human-readable message reused for both the inline state and
@@ -164,6 +291,8 @@ export interface AddEndpointFormSnapshot {
   clientSecret: string;
   scopes: string;
   serverTypeOverride: string;
+  isolationEnabled: boolean;
+  mounts: MountRow[];
 }
 
 function sameKvList(
@@ -218,6 +347,8 @@ export function computeAddEndpointIsDirty(
   if (snapshot.clientSecret !== current.clientSecret) return true;
   if (snapshot.scopes !== current.scopes) return true;
   if (snapshot.serverTypeOverride !== current.serverTypeOverride) return true;
+  if (snapshot.isolationEnabled !== current.isolationEnabled) return true;
+  if (!sameMountList(snapshot.mounts, current.mounts)) return true;
   if (!sameKvList(snapshot.envVars, current.envVars)) return true;
   if (!sameKvList(snapshot.headerVars, current.headerVars)) return true;
   if (!sameRecord(snapshot.catalogEnvValues, current.catalogEnvValues)) return true;

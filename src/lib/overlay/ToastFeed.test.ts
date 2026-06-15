@@ -316,11 +316,14 @@ describe('Overlay redesign — ghost stack stays removed', () => {
 
 // Per-card dismiss progress bar: lives inside `OverlayCard` and is
 // driven by `group.dismissTick` + `group.inflight`/`group.success`/
-// `group.error`. `ToastFeed` no longer owns any bar markup — it just
-// pipes `store.getOpts().dismissMs` down to each card as
-// `dismissDurationMs` so the CSS keyframe matches the per-group
-// `setTimeout` in `toastStore`. No hover-pause: pointer enter/leave
-// only toggles Tauri's ignore-cursor-events flag (see `OverlayApp`).
+// `group.error`. An armed group carries the exact duration its
+// `setTimeout` was armed with on `group.dismissDurationMs`, and the
+// card's CSS keyframe reads THAT. `ToastFeed` no longer owns any bar
+// markup — it just pipes the reactive `dismissMs` prop down to each card
+// as `dismissDurationMs`, which the card uses only as a fallback default
+// when the group is not counting down. No hover-pause: pointer
+// enter/leave only toggles Tauri's ignore-cursor-events flag (see
+// `OverlayApp`).
 describe('ToastFeed — per-card dismiss bar plumbing', () => {
   it('ToastFeed.svelte pipes `dismissDurationMs` into OverlayCard and renders no feed-level bar', async () => {
     const src = (await import('./ToastFeed.svelte?raw')).default as string;
@@ -336,11 +339,22 @@ describe('ToastFeed — per-card dismiss bar plumbing', () => {
     expect(overlayCardMatches).toHaveLength(1);
   });
 
-  it('ToastFeed.svelte derives dismissDurationMs from `store.getOpts().dismissMs`', async () => {
+  it('ToastFeed.svelte accepts a `dismissMs` prop and derives dismissDurationMs from it', async () => {
     const src = (await import('./ToastFeed.svelte?raw')).default as string;
-    expect(src).toMatch(
-      /const dismissDurationMs = \$derived\(store\.getOpts\(\)\.dismissMs\)/,
-    );
+    // `dismissMs` is a declared prop (typed in `Props` + destructured from
+    // `$props()`), so the duration tracks the parent reactively rather than
+    // reading the seed value off `store.getOpts()`.
+    expect(src).toMatch(/dismissMs\?: number;/);
+    expect(src).toMatch(/dismissMs = 6000,/);
+    expect(src).toMatch(/const dismissDurationMs = \$derived\(dismissMs\)/);
+    // The old `store.getOpts().dismissMs` derivation must be gone so the
+    // bar duration is not stuck at the store's seed value.
+    expect(src).not.toMatch(/\$derived\(store\.getOpts\(\)\.dismissMs\)/);
+  });
+
+  it('OverlayApp.svelte passes $overlaySettings.auto_dismiss_ms to <ToastFeed>', async () => {
+    const src = (await import('./OverlayApp.svelte?raw')).default as string;
+    expect(src).toMatch(/dismissMs=\{\$overlaySettings\.auto_dismiss_ms\}/);
   });
 
   it('ToastFeed.svelte does NOT expose any hover-pause state to OverlayCard', async () => {
@@ -371,9 +385,15 @@ describe('ToastFeed — per-card dismiss bar plumbing', () => {
     expect(src).toMatch(/style:background=\{barColor\}/);
   });
 
-  it('OverlayCard.svelte binds animation-duration to `dismissDurationMs`', async () => {
+  it('OverlayCard.svelte binds animation-duration to the captured `barDurationMs`', async () => {
     const src = (await import('./OverlayCard.svelte?raw')).default as string;
-    expect(src).toMatch(/style:animation-duration="\{dismissDurationMs\}ms"/);
+    expect(src).toMatch(/style:animation-duration="\{barDurationMs\}ms"/);
+    // `barDurationMs` prefers the store-captured `group.dismissDurationMs`
+    // (so the bar matches the per-group `setTimeout`), falling back to the
+    // piped `dismissDurationMs` prop when the group is not counting down.
+    expect(src).toMatch(
+      /const barDurationMs = \$derived\(group\.dismissDurationMs \?\? dismissDurationMs\)/,
+    );
   });
 
   it('OverlayApp.svelte has no hover-pause or renderer pointer handlers', async () => {

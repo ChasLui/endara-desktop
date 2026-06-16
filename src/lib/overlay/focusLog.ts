@@ -25,6 +25,6 @@ export async function focusLogForRequest(jsonrpcId: string | null): Promise<void
   try {
     await invoke('focus_main_window_on_log', { jsonrpcId });
   } catch (e) {
-    console.error('[overlay] focus_main_window_on_log failed:', e);
+    console.error('[overlay] invoke failed', e);
   }
 }

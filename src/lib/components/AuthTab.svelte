@@ -76,7 +76,7 @@
 
   async function handleRefresh() {
     const name = $selectedEndpoint;
-    if (!name || actionInProgress) return;
+    if (!name || actionInProgress || reauthInProgress) return;
     actionInProgress = true;
     try {
       await refreshOAuth(name);
@@ -90,7 +90,7 @@
 
   async function handleReauthorize() {
     const name = $selectedEndpoint;
-    if (!name || reauthInProgress) return;
+    if (!name || actionInProgress || reauthInProgress) return;
     reauthInProgress = true;
     try {
       await reauthorize(name, {
@@ -111,6 +111,7 @@
       (['authenticated', 'connection_failed'] as OAuthStatusValue[]).includes(status.status),
   );
   let canReauth = $derived(status !== null && canReauthorize(status.status));
+  let actionBusy = $derived(actionInProgress || reauthInProgress);
 </script>
 
 <div class="h-full overflow-y-auto p-4 space-y-4">
@@ -177,14 +178,14 @@
           <button
             class="btn-sec"
             onclick={handleRefresh}
-            disabled={actionInProgress}
+            disabled={actionBusy}
           >Refresh Now</button>
         {/if}
         {#if canReauth}
           <button
             class="btn-pri"
             onclick={handleReauthorize}
-            disabled={reauthInProgress}
+            disabled={actionBusy}
             title="Open the browser to sign in again"
             aria-label="Re-authenticate"
           >Re-authenticate</button>

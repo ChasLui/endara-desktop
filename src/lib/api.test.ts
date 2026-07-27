@@ -432,6 +432,79 @@ describe('api', () => {
     });
   });
 
+  describe('startOAuth', () => {
+    // Regression coverage: the relay returns HTTP 502 with
+    // `{"error":"discovery_unreachable","detail":...}` when RFC 8414 discovery
+    // times out. It must pass through as a typed result (like dcr_unsupported /
+    // discovery_failed) so reauthorize() can show the connectivity toast — not
+    // fall into the generic non-2xx branch and throw.
+    it('returns discovery_unreachable as a typed result instead of throwing on 502', async () => {
+      const { startOAuth } = await import('./api');
+      mockHttpError(
+        502,
+        JSON.stringify({
+          error: 'discovery_unreachable',
+          detail: 'Could not reach the OAuth server to discover its endpoints.',
+        }),
+      );
+
+      const result = await startOAuth('sunsama');
+      expect(result).toEqual({
+        error: 'discovery_unreachable',
+        detail: 'Could not reach the OAuth server to discover its endpoints.',
+      });
+    });
+
+    it('returns dcr_unsupported as a typed result instead of throwing on 4xx', async () => {
+      const { startOAuth } = await import('./api');
+      // The relay's dcr_unsupported envelope uses `message` (plus endpoint
+      // metadata), not the `{ error, detail }` ErrorResponse shape used by the
+      // discovery_* errors — see OAuthDcrUnsupportedResponse in the relay.
+      mockHttpError(
+        422,
+        JSON.stringify({
+          error: 'dcr_unsupported',
+          message: 'The OAuth server does not support Dynamic Client Registration.',
+          authorization_endpoint: 'https://auth.example.com/authorize',
+        }),
+      );
+
+      const result = await startOAuth('sunsama');
+      expect(result).toEqual({
+        error: 'dcr_unsupported',
+        message: 'The OAuth server does not support Dynamic Client Registration.',
+        authorization_endpoint: 'https://auth.example.com/authorize',
+      });
+    });
+
+    it('returns discovery_failed as a typed result instead of throwing on 400', async () => {
+      const { startOAuth } = await import('./api');
+      mockHttpError(
+        400,
+        JSON.stringify({
+          error: 'discovery_failed',
+          detail: 'OAuth discovery returned an invalid metadata document.',
+        }),
+      );
+
+      const result = await startOAuth('sunsama');
+      expect(result).toEqual({
+        error: 'discovery_failed',
+        detail: 'OAuth discovery returned an invalid metadata document.',
+      });
+    });
+
+    it('throws on a 500 with an unrelated error body (generic non-2xx branch)', async () => {
+      const { startOAuth } = await import('./api');
+      mockHttpError(
+        500,
+        JSON.stringify({ error: 'internal_error', detail: 'unexpected relay failure' }),
+      );
+
+      await expect(startOAuth('sunsama')).rejects.toThrow('unexpected relay failure');
+    });
+  });
+
   describe('oauthProbe', () => {
     // The add-server flow relies on this probe being non-blocking: any
     // failure/timeout/non-2xx must resolve to `{ oauth_supported: false }`

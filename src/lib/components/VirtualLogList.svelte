@@ -9,6 +9,7 @@
     becameVisible,
     isPinnedToBottom,
     itemKeyAt,
+    shouldRepinOnUnhide,
     shouldReportInitialPinned,
     shouldStickToBottom,
   } from './virtual-log-list-helpers';
@@ -29,6 +30,19 @@
     row: Snippet<[T, number]>;
     /** Called when the pinned-to-bottom state flips (isAtBottom semantics). */
     onscrollstate?: (pinned: boolean) => void;
+    /**
+     * Tail-pinned log semantics (default). When false the list is a plain
+     * top-anchored virtualized list: no tail-follow on item changes, no
+     * re-pin on unhide, no initial pinned report.
+     */
+    followTail?: boolean;
+    /**
+     * ARIA role for the scroll container (e.g. "rowgroup" when the rows are
+     * ARIA table rows). The internal spacer/positioner divs are marked
+     * role="presentation" so the owned-element chain (table → rowgroup →
+     * row) stays intact for assistive tech.
+     */
+    role?: string;
     /** Extra classes for the scroll container (sizing, colors, ...). */
     class?: string;
   };
@@ -39,6 +53,8 @@
     overscan = DEFAULT_OVERSCAN,
     row,
     onscrollstate,
+    followTail = true,
+    role = undefined,
     class: className = '',
   }: Props = $props();
 
@@ -77,7 +93,13 @@
   // notifies on flips.
   let reportedInitialPinned = false;
   $effect(() => {
-    if (!shouldReportInitialPinned(scrollEl !== undefined, reportedInitialPinned)) return;
+    // followTail is read tracked (like scrollEl) so toggling the prop after
+    // mount re-evaluates the effect; pinned stays untracked.
+    const follow = followTail;
+    if (
+      !shouldReportInitialPinned(scrollEl !== undefined, reportedInitialPinned, follow)
+    )
+      return;
     reportedInitialPinned = true;
     onscrollstate?.(untrack(() => pinned));
   });
@@ -89,7 +111,18 @@
   $effect(() => {
     const count = items.length;
     const store = virtualizer;
-    if (!shouldStickToBottom(untrack(() => pinned), count, scrollEl?.clientHeight ?? 0)) return;
+    // followTail is read tracked so flipping the prop re-runs tail-follow;
+    // pinned stays untracked (scroll flips must not retrigger this effect).
+    const follow = followTail;
+    if (
+      !shouldStickToBottom(
+        untrack(() => pinned),
+        count,
+        scrollEl?.clientHeight ?? 0,
+        follow,
+      )
+    )
+      return;
     tick().then(() => {
       if (!pinned) return;
       const inst = get(store);
@@ -129,7 +162,7 @@
       prevHeight = nextHeight;
       if (!shown) return;
       get(store).measure();
-      if (pinned) {
+      if (shouldRepinOnUnhide(pinned, followTail)) {
         tick().then(() => {
           const inst = get(store);
           inst.scrollToOffset(inst.getTotalSize(), { align: 'end' });
@@ -168,13 +201,14 @@
   }
 </script>
 
-<div bind:this={scrollEl} onscroll={handleScroll} class="overflow-y-auto {className}">
-  <div class="relative w-full" style:height="{$virtualizer.getTotalSize()}px">
+<div bind:this={scrollEl} onscroll={handleScroll} {role} class="overflow-y-auto {className}">
+  <div role="presentation" class="relative w-full" style:height="{$virtualizer.getTotalSize()}px">
     {#each $virtualizer.getVirtualItems() as vItem, i (vItem.key)}
       {@const item = items[vItem.index]}
       <div
         bind:this={rowEls[i]}
         data-index={vItem.index}
+        role="presentation"
         class="absolute top-0 left-0 w-full"
         style:transform="translateY({vItem.start}px)"
       >

@@ -7,11 +7,15 @@
     DEFAULT_OVERSCAN,
     DEFAULT_ROW_ESTIMATE_PX,
     becameVisible,
+    captureScrollAnchor,
+    findIndexByKey,
     isPinnedToBottom,
     itemKeyAt,
+    restoredScrollTop,
     shouldRepinOnUnhide,
     shouldReportInitialPinned,
     shouldStickToBottom,
+    type ScrollAnchor,
   } from './virtual-log-list-helpers';
 
   // Shared virtualized log list built on @tanstack/svelte-virtual. Renders
@@ -20,7 +24,13 @@
   // drive their auto-scroll and "Go to end" affordances.
 
   type Props = {
-    /** Rows to render. Only the windowed subset is mounted. */
+    /**
+     * Rows to render. Only the windowed subset is mounted. Must be REPLACED
+     * (new array) on change, never mutated in place: the effects below track
+     * the prop reference, so an in-place mutation (same array, same length)
+     * is invisible to the count sync, tail-follow, and scroll re-anchoring.
+     * Every consumer already does this (mergeCalls & co. return new arrays).
+     */
     items: readonly T[];
     /** Stable string key per item — wired into the virtualizer's getItemKey. */
     getKey: (item: T, index: number) => string;
@@ -79,12 +89,60 @@
     });
   });
 
+  // Top-anchored re-anchor, part 1 (capture): live merges PREPEND rows and
+  // the transform-positioned virtual rows defeat native scroll anchoring, so
+  // content under the cursor would shift down on every merge. Before the new
+  // items render ($effect.pre runs ahead of DOM updates and the count-sync
+  // effect below, so getVirtualItems() still reflects the OLD layout),
+  // remember the first visible row's key + viewport offset. Tail-follow mode
+  // and scrollTop 0 capture nothing (see captureScrollAnchor).
+  let pendingAnchor: ScrollAnchor | null = null;
+  $effect.pre(() => {
+    // Track the items reference: consumers replace the array on change (see
+    // the Props doc), so this reruns on every merge, prepend, or eviction.
+    void items;
+    const follow = followTail;
+    const el = scrollEl;
+    if (!el) {
+      pendingAnchor = null;
+      return;
+    }
+    const rows = get(virtualizer)
+      .getVirtualItems()
+      .map((v) => ({ key: String(v.key), start: v.start, end: v.end }));
+    pendingAnchor = captureScrollAnchor(follow, el.scrollTop, rows);
+  });
+
   // Keep options in sync when items grow/shrink/are replaced, without
   // recreating the virtualizer (which would drop its measurement cache).
   $effect(() => {
     const count = items.length;
     const os = overscan;
     get(virtualizer).setOptions({ count, overscan: os });
+  });
+
+  // Top-anchored re-anchor, part 2 (restore): after the merge rendered,
+  // scroll so the captured row sits at the same viewport offset again. If
+  // the row vanished (evicted by the consumer's live cap) or nothing moved
+  // (append-only merge), this is a no-op.
+  $effect(() => {
+    // Track the items reference (same replacement contract as the capture).
+    void items;
+    const store = virtualizer;
+    const anchor = pendingAnchor;
+    pendingAnchor = null;
+    if (!anchor) return;
+    tick().then(() => {
+      const el = scrollEl;
+      if (!el) return;
+      const inst = get(store);
+      // Refresh the measurement cache before reading row offsets.
+      inst.getVirtualItems();
+      const index = findIndexByKey(items, anchor.key, getKey);
+      const newStart = index === -1 ? null : (inst.measurementsCache[index]?.start ?? null);
+      const target = restoredScrollTop(anchor, newStart, el.scrollTop);
+      if (target !== null) inst.scrollToOffset(target);
+    });
   });
 
   // Report the initial pinned state once the scroll element is bound, so a

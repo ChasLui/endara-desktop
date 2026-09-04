@@ -20,13 +20,17 @@ Add MCP servers, manage OAuth, browse tools — without ever opening a terminal.
 ## What can you do?
 
 - **Visual endpoint dashboard** — see every MCP server you've added with live health indicators, all in one place.
-- **Live tool-call overlay** — an always-on-top, click-through window in the corner of your screen shows every MCP tool call as it happens, with success / failure / duration and a repeat-call counter so bursts collapse into a single card.
+- **Live tool-call overlay** — an always-on-top, click-through window in the corner of your screen shows every MCP tool call as it happens, with the calling client, success / failure / duration, and a repeat-call counter so bursts collapse into a single card. Click a card to jump to that exact call in the Observability tab.
+- **Observability tab** — browse a searchable history of every tool call with filters, latency sparklines, and request / response payload drill-through.
+- **Run servers in containers** — toggle Docker / Podman isolation when adding a STDIO server, with host bind mounts and an automatic direct-spawn fallback when no runtime is installed.
 - **Endpoint profiles** — group endpoints into named profiles served under their own `/mcp/{profile}` URL so different agents can share one relay without sharing one catalog.
 - **Tray health at a glance** — the tray icon flips green / yellow / red and the menu's first line spells out the exact reason (sign-in needed, endpoint unhealthy, relay stopped) without opening the app.
 - **Search tools** across every connected server from a single ⌘K palette.
-- **Watch real-time logs** stream from each endpoint as requests flow through.
-- **Manage OAuth flows** end-to-end inside the app — no copy-pasting tokens between terminals.
-- **Single-click add server** for STDIO, SSE, or HTTP MCP servers — paste a command or URL and you're done.
+- **Watch real-time logs** stream from each endpoint as requests flow through — log views are virtualized, so even thousands of buffered lines scroll smoothly.
+- **Grant sandbox write access visually** — pick the directories that JS-execution scripts may write into (the relay's `write_dirs` allowlist) with a native folder picker in Settings; the sandbox's `writeFile()` rejects any path outside these directories.
+- **Manage OAuth flows** end-to-end inside the app — sign in just in time when a server needs it, and re-authenticate or refresh from the **Auth** tab without copy-pasting tokens.
+- **Connect enterprise SSO once per organization** — add your identity provider (e.g. Okta) as an organization, sign in, and Endara detects which of your MCP servers accept it; every server sharing an organization draws from one pooled, silently-refreshed credential.
+- **Single-click add server** for STDIO, SSE, or HTTP MCP servers — paste a command or URL (and, for STDIO servers, optionally run it in a container), and you're done.
 
 ## What is this?
 
@@ -71,12 +75,17 @@ Or [build from source](#development) if you prefer.
 
 - **System tray integration** — Runs in your menu bar / system tray, always available without cluttering your workspace
 - **Tray health indicator** — The tray icon itself flips green / yellow / red to reflect overall relay health, and the menu's first line spells out the exact reason (e.g. `Endara — Sign in required for linear`)
-- **Tool-call overlay window** — Always-on-top, click-through window that surfaces every MCP tool call as a card (in-flight blue → success green / failure red), with stacked count chips when the same tool is called in quick succession. Configurable corner, max-cards, and "hide while Endara is focused" toggles in the **Overlay** section of Settings.
+- **Tool-call overlay window** — Always-on-top, click-through window that surfaces every MCP tool call as a card (in-flight blue → success green / failure red), labelled with the calling client, with stacked count chips when the same tool is called in quick succession. A left accent bar reflects call status (blue while in flight, red on any failure), and clicking a card opens the main window on the **Observability** tab filtered to that exact call. Configurable corner, max-cards, and "hide while Endara is focused" toggles in the **Overlay** section of Settings.
 - **Endpoint profiles** — Group endpoints into named profiles via the **Profiles** tab, each served at `/mcp/{profile}` with its own JS-execution and TOON-output toggles. The tab renders a copyable `claude_desktop_config.json` snippet for each profile.
+- **Observability tab** — Browse recorded tool calls with filters (server, tool, status, time window), latency sparklines, and full request / response payload drill-through, plus a one-click purge. Backed by the relay's durable observability store.
+- **Container isolation** — When adding a STDIO server, toggle **Run in container** to run it under Docker or Podman with optional host bind mounts; servers flagged as not-containerizable show a badge and run directly, and a missing runtime falls back to direct spawn.
+- **Just-in-time OAuth** — Servers that need authentication prompt you to sign in at add time and again if a token goes stale; refresh or re-authenticate from the **Auth** tab.
+- **Organizations (enterprise SSO)** — A guided onboarding flow takes you from picking an identity provider, through SSO sign-in and automatic detection of which MCP servers accept the organization's credentials, to connecting the ones you choose. Manage organizations from **Settings** (re-authenticate or remove them), a full-width banner warns when an organization's session expires, and per-server resource credentials (client ID / secret, scopes) live under the consolidated **Advanced** section when adding or editing a server.
 - **Relay lifecycle management** — Auto-starts the relay on launch, monitors it, auto-restarts on crash, kills on quit
-- **Endpoint dashboard** — View all configured MCP server endpoints with live health indicators (🟢 healthy / 🟡 degraded / 🔴 down)
+- **Endpoint dashboard** — View all configured MCP server endpoints with live health indicators (🟢 healthy / 🟡 degraded / 🔴 down), plus Starting… / Stopping… progress hints while a server is toggled on or off
 - **Tool browser** — Browse and search all tools exposed by each endpoint
-- **Real-time logs** — Stream log output from each endpoint as it happens
+- **Real-time logs** — Stream log output from each endpoint as it happens; the Relay Logs and per-endpoint Logs views render only the visible rows (virtualized), so the full 5,000-line buffer never bogs down the UI
+- **Write directories** — A **Write directories** section in Settings manages the relay's `[relay] write_dirs` allowlist — the directories sandbox scripts may write into via `writeFile()`, which rejects any path outside them. Add entries with a native folder picker, remove them with one click; changes are persisted to `config.toml` and pushed to the running relay without a restart
 - **Config viewer** — Inspect the current relay configuration
 - **Dark mode** — Follows your system preference automatically
 - **Auto-updates** — Checks GitHub Releases for new versions via the Tauri updater plugin
@@ -117,7 +126,7 @@ Endara Desktop is a [Tauri 2](https://v2.tauri.app) application with two layers:
 
 - **Relay lifecycle** — `start_relay`, `stop_relay`, `restart_relay`, `relay_status`, `get_sidecar_status`, `get_buffered_relay_logs`, `get_relay_port`, `set_relay_port`.
 - **Management-API proxy** — `mgmt_api_request` proxies HTTP-shaped `/api/*` calls from the SvelteKit frontend over the relay's per-user Unix socket / Named Pipe; `get_mgmt_api_socket_path` exposes the socket path for diagnostics.
-- **Config & endpoints** — `get_endpoint_config`, `add_endpoint`, `update_endpoint`, `remove_endpoint`, `get_config_path_display`, `set_js_execution_mode`.
+- **Config & endpoints** — `get_endpoint_config`, `add_endpoint`, `update_endpoint`, `remove_endpoint`, `get_config_path_display`, `set_js_execution_mode`, `get_write_dirs`, `set_write_dirs`.
 - **Updates & autostart** — `get_update_channel`, `set_update_channel`, `check_for_update`, `download_and_install_update`, `show_update_notification`, `get_autostart`, `set_autostart`, `get_build_info`.
 
 **Frontend (SvelteKit):** Talks to the relay's management API to fetch endpoint status, tools, logs, and configuration. The UI is organized around a sidebar (endpoint list) + detail panel (per-endpoint tabs for tools, logs, config, auth) layout. Auxiliary components include onboarding, search palette, settings, an add-endpoint modal, and a unified tool catalog.

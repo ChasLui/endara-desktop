@@ -6,6 +6,7 @@ export const endpoints = writable<Endpoint[]>([]);
 export const selectedEndpoint = writable<string | null>(null);
 export const jsExecutionMode = writable<boolean>(false);
 export const toonOutput = writable<boolean>(true);
+export const writeDirs = writable<string[]>([]);
 
 function createThemeStore() {
   const stored = typeof window !== 'undefined' ? localStorage.getItem('endara-theme') as Theme | null : null;
@@ -55,7 +56,7 @@ export const theme = createThemeStore();
 export const searchQuery = writable<string>('');
 export const activeTab = writable<'tools' | 'logs' | 'config' | 'auth' | 'profiles'>('tools');
 export const oauthStatuses = writable<Map<string, OAuthStatus>>(new Map());
-export const activeTopLevelTab = writable<'servers' | 'unified-catalog' | 'profiles' | 'relay-logs' | 'settings'>('servers');
+export const activeTopLevelTab = writable<'servers' | 'unified-catalog' | 'profiles' | 'observability' | 'relay-logs' | 'settings'>('servers');
 
 export const relayLogLines = writable<ParsedLogLine[]>([]);
 export const miniPlayerMode = writable<boolean>(false);

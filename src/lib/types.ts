@@ -5,6 +5,37 @@ export interface RelayStatus {
   uptime_seconds: number;
   endpoint_count: number;
   healthy_count: number;
+  /**
+   * Whether the relay detected a usable container runtime (Docker/Podman)
+   * on the host. Optional — older relays omit it, so only an explicit
+   * `false` should drive the "no runtime" notice in the Add Server flow.
+   */
+  container_runtime_available?: boolean;
+}
+
+/**
+ * Live resource usage polled from the container runtime for a containerized
+ * stdio endpoint. Mirrors the relay's `container_stats` management-API field.
+ */
+export interface ContainerStats {
+  cpu_percent: number;
+  mem_bytes: number;
+  net_rx_bytes: number;
+  net_tx_bytes: number;
+}
+
+/**
+ * Isolation status reported by the relay for stdio endpoints. `configured`
+ * is what `config.toml` asked for; `actual` is what the relay actually did
+ * (it falls back to a direct spawn when no container runtime is usable).
+ * Absent for non-stdio endpoints and for older relays that predate the field.
+ */
+export interface IsolationState {
+  configured: 'container' | 'none';
+  actual: 'container' | 'direct';
+  runtime?: 'docker' | 'podman';
+  container_name?: string;
+  image?: string;
 }
 
 // Lifecycle state from the management API (GET /api/endpoints)
@@ -36,6 +67,19 @@ export interface LifecycleStopped {
 
 export type Lifecycle = LifecycleReady | LifecycleFailed | LifecycleInitializing | LifecycleStopped;
 
+/**
+ * EMA org-binding summary surfaced on the endpoints listing (Wave 12). Mirrors
+ * the relay's `EmaAuthSummary`: present only for `auth.type = "ema"` endpoints,
+ * absent for ordinary endpoints. The desktop reads this from the listing — NOT
+ * from `getEndpointConfig` (which reads local TOML) — to de-dupe org-bound
+ * servers during onboarding.
+ */
+export interface EmaAuthSummary {
+  type: 'ema';
+  organization?: string;
+  resource?: string;
+}
+
 export interface Endpoint {
   name: string;
   transport: 'stdio' | 'sse' | 'http' | 'oauth';
@@ -45,6 +89,23 @@ export interface Endpoint {
   disabled: boolean;
   error?: string;
   lifecycle?: Lifecycle;
+  /**
+   * EMA org-binding (Wave 12). Present only for org-bound `auth.type="ema"`
+   * endpoints; absent for ordinary endpoints and END-18 bare-`idp` endpoints
+   * with no organization reference.
+   */
+  auth?: EmaAuthSummary;
+  /**
+   * Present only for containerized stdio endpoints; absent/null for
+   * direct-spawn endpoints. Updated by the relay's stats poller and picked
+   * up by the desktop's 2s endpoint poll loop.
+   */
+  container_stats?: ContainerStats | null;
+  /**
+   * Present only for stdio endpoints on relays that report it; absent for
+   * non-stdio endpoints and older relays.
+   */
+  isolation_state?: IsolationState | null;
 }
 
 export interface Tool {
@@ -106,7 +167,16 @@ export interface OAuthStartDiscoveryFailed {
   detail?: string;
 }
 
-export type OAuthStartResult = OAuthStartSuccess | OAuthStartDcrUnsupported | OAuthStartDiscoveryFailed;
+export interface OAuthStartDiscoveryUnreachable {
+  error: 'discovery_unreachable';
+  detail?: string;
+}
+
+export type OAuthStartResult =
+  | OAuthStartSuccess
+  | OAuthStartDcrUnsupported
+  | OAuthStartDiscoveryFailed
+  | OAuthStartDiscoveryUnreachable;
 
 export type OAuthSetupStatus = 'awaiting_credentials' | 'awaiting_auth' | 'authorized';
 
@@ -127,6 +197,210 @@ export interface OAuthSetupStatusResponse {
   status: OAuthSetupStatus;
   name: string;
   url: string;
+}
+
+// ---------------------------------------------------------------------------
+// Observability
+// ---------------------------------------------------------------------------
+//
+// ⚠️ Casing is intentionally mixed to mirror the relay's serialization exactly:
+// CallRecordDto / AggregateBucketDto / ObservabilitySummary are camelCase, while
+// StoredPayloads and ObservabilityConfig are snake_case (no `rename_all`).
+
+/**
+ * A single proxied `tools/call` metadata row from `observability.db`. camelCase;
+ * the relay omits `Option` fields when null, so most fields are optional.
+ * Returned by the drill-through `GET /observability/calls/{request_uid}` route
+ * — the list route returns the slim {@link CallSummaryDto} instead.
+ */
+export interface CallRecordDto {
+  id: number;
+  requestUid: string;
+  endpoint: string;
+  serverName: string;
+  serverType?: string;
+  transport?: string;
+  profile?: string;
+  clientName?: string;
+  clientVersion?: string;
+  clientUserAgent?: string;
+  clientOrigin?: string;
+  tool: string;
+  tsStart: number;
+  tsEnd?: number;
+  durationMs?: number;
+  success: boolean;
+  errorMessage?: string;
+  requestBytes?: number;
+  responseBytes?: number;
+  streamed: boolean;
+}
+
+/**
+ * Slim per-row DTO for the calls list table — the only fields the list view
+ * actually renders. Drops transport/client/payload-byte detail so a 100-row
+ * page stays a few KB on the wire. The full {@link CallRecordDto} is still
+ * served by the drill-through detail route.
+ */
+export interface CallSummaryDto {
+  id: number;
+  requestUid: string;
+  serverName?: string;
+  tool: string;
+  tsStart: number;
+  durationMs: number;
+  success: boolean;
+  errorMessage?: string;
+  requestBytes: number;
+  responseBytes: number;
+}
+
+/** One aggregate time bucket (camelCase). `server` absent = all-servers bucket. */
+export interface AggregateBucketDto {
+  server?: string;
+  bucketStart: number;
+  count: number;
+  errorCount: number;
+  p50Ms: number;
+  p95Ms: number;
+}
+
+/** Live observability pipeline summary (camelCase). */
+export interface ObservabilitySummary {
+  enabled: boolean;
+  storePayloads: boolean;
+  dropped: number;
+  payloadBufferLen: number;
+  payloadBufferBytes: number;
+}
+
+/** Buffered request/response payloads for a single call (⚠️ snake_case). */
+export interface StoredPayloads {
+  request: string;
+  response: string;
+  request_truncated: boolean;
+  response_truncated: boolean;
+  streamed: boolean;
+  captured_at_ms: number;
+}
+
+/** Global observability configuration (⚠️ snake_case). */
+export interface ObservabilityConfig {
+  enabled: boolean;
+  store_payloads: boolean;
+  payload_window_minutes: number;
+  record_retention_days: number;
+  max_db_size_mb: number;
+  max_payload_bytes: number;
+  payload_buffer_budget_mb: number;
+}
+
+/**
+ * `GET /observability/calls` response wrapper. Pagination is keyset on
+ * `(tsStart, id)` via an opaque `nextCursor` token — absent when the page is
+ * the last one. Pass the token back as the `cursor` query param to fetch the
+ * next page.
+ */
+export interface CallsResponse {
+  calls: CallSummaryDto[];
+  limit: number;
+  nextCursor?: string;
+}
+
+/** `GET /observability/calls/{request_uid}` response wrapper. */
+export interface CallDetail {
+  record: CallRecordDto;
+  payloadStatus: 'stored' | 'expired' | 'disabled';
+  payloads?: StoredPayloads;
+}
+
+/** `GET /observability/aggregates` response wrapper. */
+export interface AggregatesResponse {
+  buckets: AggregateBucketDto[];
+  summary: ObservabilitySummary;
+}
+
+/**
+ * Result of the add-time OAuth capability probe (POST /api/oauth/probe).
+ * `authorization_server` and `scopes_supported` are present only when
+ * `oauth_supported` is `true`. Any probe failure/timeout is reported by the
+ * relay (and by the desktop client) as `{ oauth_supported: false }`.
+ */
+export interface OAuthProbeResult {
+  oauth_supported: boolean;
+  authorization_server?: string;
+  scopes_supported?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Organizations + EMA (Enterprise-Managed Authorization)
+// ---------------------------------------------------------------------------
+
+/**
+ * One identity-provider template from `GET /api/idp-providers`. Mirrors the
+ * relay's `IdpProvider` (oauth/idp_providers.rs): `issuer_pattern` carries a
+ * `{slug}` placeholder for tenant-scoped providers (absent for `custom`), and
+ * `slug_hint` describes the slug the user must supply (absent for Google /
+ * custom). The desktop "Add organization" UI renders this table.
+ */
+export interface IdpProvider {
+  id: string;
+  name: string;
+  issuer_pattern?: string;
+  slug_hint?: string;
+}
+
+/**
+ * One organization from `GET /api/organizations`. `authenticated` reflects
+ * whether the relay's credential pool holds usable IdP credentials for the org
+ * (a non-expired ID token or a refresh token to silently re-mint one).
+ *
+ * `client_secret_set` is optional — older relays omit it. When present and
+ * `true` the org has a confidential-client secret persisted in the secure
+ * credential store; the secret value itself is never returned to the UI.
+ */
+export interface Organization {
+  name: string;
+  provider: string;
+  idp: string;
+  authenticated: boolean;
+  client_secret_set?: boolean;
+}
+
+/**
+ * Response from `POST /api/organizations` and
+ * `POST /api/organizations/{org}/reauthenticate`: a freshly-composed IdP SSO
+ * authorize URL the desktop opens to run (or re-run) the IdP sign-in.
+ */
+export interface OrganizationSsoResponse {
+  name: string;
+  provider: string;
+  idp: string;
+  authorize_url: string;
+}
+
+/**
+ * Reachability of a single MCP resource for an organization, as returned by
+ * the EMA capability probe. Mirrors the relay's lowercase `OrgProbeStatus`:
+ * `accessible` (the IdP minted an ID-JAG), `denied` (terminal authorization
+ * denial), or `unreachable` (discovery/transport/timeout failure).
+ */
+export type OrgProbeStatus = 'accessible' | 'denied' | 'unreachable';
+
+/**
+ * One probe outcome for a single resource from
+ * `POST /api/organizations/{org}/probe`. `server_as_issuer` is the discovered
+ * RFC 8414 issuer, present whenever discovery succeeded.
+ */
+export interface OrgProbeResult {
+  resource: string;
+  status: OrgProbeStatus;
+  server_as_issuer?: string;
+}
+
+/** Response body for `POST /api/organizations/{org}/probe`. */
+export interface OrgProbeResponse {
+  results: OrgProbeResult[];
 }
 
 export type Theme = 'light' | 'dark' | 'system';

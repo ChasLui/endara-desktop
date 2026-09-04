@@ -1,10 +1,32 @@
 import { activeTopLevelTab, selectedEndpoint } from '$lib/stores';
+import type { ParsedLogLine } from '$lib/logParser';
 
 /**
  * Helpers for the relay log view endpoint affordances (Slice B,
  * engineering spec §2.4). Extracted as pure functions so they can be unit
  * tested in the Node test env without spinning up a Svelte runtime.
  */
+
+let nextLineId = 0;
+const lineIds = new WeakMap<ParsedLogLine, string>();
+
+/**
+ * Stable string key for a log line, for `VirtualLogList`'s `getKey`.
+ *
+ * Keyed by object identity via a lazily-assigned monotonic id — the string
+ * equivalent of the old `{#each filteredLines as line (line)}` object key.
+ * `raw` alone is not usable: the relay-logs buffer is not deduped, so two
+ * identical lines would collide. The WeakMap keeps trimmed/cleared lines
+ * collectable.
+ */
+export function lineKey(line: ParsedLogLine): string {
+  let key = lineIds.get(line);
+  if (key === undefined) {
+    key = `rl-${nextLineId++}`;
+    lineIds.set(line, key);
+  }
+  return key;
+}
 
 /**
  * Click-to-filter toggle for the endpoint column.
@@ -33,26 +55,4 @@ export function toggleEndpointFilter(
 export function applyGoToEndpoint(name: string): void {
   selectedEndpoint.set(name);
   activeTopLevelTab.set('servers');
-}
-
-/**
- * Find the index of the latest log row whose `request{id="..."}` span
- * matches `jsonrpcId`. Used by the RelayLogs view to scroll to and
- * highlight the row that the overlay card click selected.
- *
- * Scans newest-first so a JSON-RPC id reused across reconnections (the
- * relay numbers from 0 on each fresh MCP session) resolves to the most
- * recent occurrence rather than an earlier one that has scrolled off
- * the user's attention.
- *
- * Returns `-1` when no row matches.
- */
-export function findRequestRowIndex<T extends { requestId?: string }>(
-  lines: readonly T[],
-  jsonrpcId: string,
-): number {
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].requestId === jsonrpcId) return i;
-  }
-  return -1;
 }

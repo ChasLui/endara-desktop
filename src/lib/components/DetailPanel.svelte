@@ -12,34 +12,107 @@
   import HealthDot from './HealthDot.svelte';
   import EndpointIcon from './EndpointIcon.svelte';
   import TransportBadge from './TransportBadge.svelte';
+  import IsolationBadge from './IsolationBadge.svelte';
   import AuthTab from './AuthTab.svelte';
   import ProfilesTab from './ProfilesTab.svelte';
   import {
     shouldShowRestartButton,
     shouldShowRefreshButton,
     shouldShowReauthorizeButton,
+    createReauthGateState,
+    evaluateReauthGate,
     visibleTabs,
+    formatBytes,
+    formatCpuPercent,
   } from './detail-panel-helpers';
+  import { getCustomImage, getEndpointStatusLabel } from './endpoint-row-helpers';
+  import {
+    endpointTransitions,
+    markStarting,
+    markStopping,
+    clearTransition,
+    transitionLabel,
+    shouldClearTransition,
+  } from '$lib/stores/endpointTransitions';
 
   let showRestartConfirm = $state(false);
   let showDeleteConfirm = $state(false);
   let toggling = $state(false);
   let reauthInProgress = $state(false);
 
-  let oauthStatus = $derived(
-    $selectedEndpointData ? $oauthStatuses.get($selectedEndpointData.name)?.status ?? null : null
-  );
-  let showReauthorize = $derived(
-    $selectedEndpointData
-      ? shouldShowReauthorizeButton($selectedEndpointData.transport, oauthStatus)
-      : false
-  );
+  // Stability gate for the reauthorize bar: a freshly-built OAuth adapter
+  // reports a transient `needs_login` for ~1-2s before its just-stored token
+  // loads and it flips to `authenticated`. Only surface the bar once that
+  // status is stable (>=2 consecutive polls or past a short grace window) so
+  // the post-add / restart transient doesn't flash a misleading bar. Kept as a
+  // plain (non-reactive) variable so writing it from the effect below doesn't
+  // re-trigger the effect; the global 2s poll re-emits `oauthStatuses` each
+  // cycle, which drives re-evaluation.
+  let reauthGate = createReauthGateState();
+  let showReauthorize = $state(false);
+
+  $effect(() => {
+    const statuses = $oauthStatuses;
+    const ep = $selectedEndpointData;
+    const name = ep?.name ?? null;
+    const status = name ? statuses.get(name)?.status ?? null : null;
+    const reauthNeeded = ep ? shouldShowReauthorizeButton(ep.transport, status) : false;
+    const result = evaluateReauthGate(reauthGate, {
+      endpointName: name,
+      reauthNeeded,
+      now: Date.now(),
+    });
+    reauthGate = result.state;
+    showReauthorize = result.showBar;
+  });
+
+  // Close any open delete/restart confirm modal when the selected server
+  // changes so a confirm opened for one server can't carry over to the next.
+  // Tracked via a plain (non-reactive) variable — same prev-endpoint approach
+  // as the reauth gate above — so writing it from the effect doesn't
+  // re-trigger the effect, and we only reset when the name actually changes
+  // (opening a modal on the current server is left alone).
+  let prevConfirmEndpoint: string | null = null;
+
+  $effect(() => {
+    const name = $selectedEndpoint;
+    if (name !== prevConfirmEndpoint) {
+      prevConfirmEndpoint = name;
+      showDeleteConfirm = false;
+      showRestartConfirm = false;
+    }
+  });
 
   let tabs = $derived(
     $selectedEndpointData
       ? visibleTabs($selectedEndpointData.transport, !!$selectedEndpointData.disabled)
       : []
   );
+
+  // Optimistic toggle hint for the currently-selected endpoint (null when no
+  // enable/disable is in flight). Drives the spinner + "Starting…/Stopping…"
+  // label on the toggle and the header secondary line.
+  let selectedPending = $derived(
+    $selectedEndpointData ? $endpointTransitions.get($selectedEndpointData.name) ?? null : null
+  );
+
+  // Reconcile pending transitions against the 2s endpoint poll: clear each one
+  // once the relay actually reports the target state (Ready/healthy for start,
+  // disabled/Stopped for stop), on any Failed/error, or after the safety
+  // timeout. Iterates the whole list so sidebar-row hints clear too, not just
+  // the selected endpoint's.
+  $effect(() => {
+    const list = $endpoints;
+    const pending = $endpointTransitions;
+    if (pending.size === 0) return;
+    const now = Date.now();
+    for (const [name, transition] of pending) {
+      const ep = list.find((e) => e.name === name);
+      if (shouldClearTransition(transition, ep, now)) {
+        clearTransition(name);
+      }
+    }
+  });
 
   $effect(() => {
     const ep = $selectedEndpointData;
@@ -49,6 +122,7 @@
   });
 
   async function handleRestart() {
+    showRestartConfirm = false;
     const name = $selectedEndpoint;
     if (name) {
       try {
@@ -58,7 +132,6 @@
         toast.error(`Failed to restart "${name}"`);
       }
     }
-    showRestartConfirm = false;
   }
 
   async function handleRefresh() {
@@ -77,9 +150,17 @@
     const ep = $selectedEndpointData;
     if (!ep || toggling) return;
     toggling = true;
-    const action = ep.disabled ? 'enable' : 'disable';
+    const enabling = ep.disabled;
+    const action = enabling ? 'enable' : 'disable';
+    // Optimistically mark the transition BEFORE the await so the hint shows
+    // immediately on the toggle/header and sidebar row, ahead of the next poll.
+    if (enabling) {
+      markStarting(ep.name);
+    } else {
+      markStopping(ep.name);
+    }
     try {
-      if (ep.disabled) {
+      if (enabling) {
         await enableEndpoint(ep.name);
       } else {
         await disableEndpoint(ep.name);
@@ -90,16 +171,28 @@
       } catch {
         // Mutation already succeeded — silent on purpose. The 2s poll
         // loop in +page.svelte reconciles the list; surfacing a refresh
-        // error on top of the success toast below would confuse users.
+        // error on top of the toast below would confuse users.
       }
-      toast.success(`Server "${ep.name}" ${ep.disabled ? 'enabled' : 'disabled'}`);
+      // No premature "enabled" toast: the relay is still spinning the server
+      // up. The persistent "Starting…" hint communicates progress and the
+      // reconciliation effect clears it once the relay reports Ready. Disable
+      // completes quickly, so a success toast is fine there.
+      if (enabling) {
+        toast.success(`Starting "${ep.name}"…`);
+      } else {
+        toast.success(`Server "${ep.name}" disabled`);
+      }
     } catch {
+      // The mutation failed, so the server won't change state — drop the
+      // optimistic hint immediately instead of waiting for the safety timeout.
+      clearTransition(ep.name);
       toast.error(`Failed to ${action} "${ep.name}"`);
     }
     toggling = false;
   }
 
   async function handleDelete() {
+    showDeleteConfirm = false;
     const name = $selectedEndpoint;
     if (name) {
       try {
@@ -118,7 +211,6 @@
         toast.error(`Failed to delete "${name}"`);
       }
     }
-    showDeleteConfirm = false;
   }
 
   async function handleReauthorize() {
@@ -154,11 +246,41 @@
           <h2 class="dhdr-name truncate">{ep.name}</h2>
           <div class="flex items-center gap-2 mt-0.5">
             <TransportBadge transport={ep.transport} />
-            <span class="text-[11px] text-(--fg3)">{ep.tool_count} tools</span>
+            <IsolationBadge isolation={ep.isolation_state} />
+            <span class="text-[11px] {selectedPending ? 'text-(--accent)' : 'text-(--fg3)'}"
+              >{transitionLabel(selectedPending) ?? getEndpointStatusLabel(ep)}</span>
           </div>
+          {#if getCustomImage(ep.isolation_state) || ep.container_stats}
+            <div class="flex items-center gap-2 mt-0.5">
+              {#if getCustomImage(ep.isolation_state)}
+                <span
+                  class="text-[11px] text-(--fg3) truncate"
+                  title="Custom container image"
+                >{getCustomImage(ep.isolation_state)}</span>
+              {/if}
+              {#if ep.container_stats}
+                <span
+                  class="text-[11px] text-(--fg3) truncate"
+                  title="Live container resource usage (CPU, memory, network received/sent)"
+                >
+                  CPU {formatCpuPercent(ep.container_stats.cpu_percent)}
+                  · Mem {formatBytes(ep.container_stats.mem_bytes)}
+                  · Net ↓{formatBytes(ep.container_stats.net_rx_bytes)} ↑{formatBytes(ep.container_stats.net_tx_bytes)}
+                </span>
+              {/if}
+            </div>
+          {/if}
         </div>
       </div>
       <div class="flex items-center gap-1.5 flex-shrink-0">
+        {#if selectedPending}
+          <span class="flex items-center gap-1 text-[11px] text-(--accent)">
+            <svg class="w-3 h-3 animate-spin" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="3" stroke-dasharray="28" stroke-dashoffset="8" stroke-linecap="round" />
+            </svg>
+            {transitionLabel(selectedPending)}
+          </span>
+        {/if}
         <button
           class="tgl {ep.disabled ? 'tgl-off' : ''} {toggling ? 'opacity-50' : ''}"
           onclick={handleToggle}

@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
 
-import { findRequestRowIndex, toggleEndpointFilter } from './relay-logs-helpers';
+import type { ParsedLogLine } from '$lib/logParser';
+import { lineKey, toggleEndpointFilter } from './relay-logs-helpers';
+
+function mkLine(raw: string): ParsedLogLine {
+  return { timestamp: new Date(0), level: 'info', message: raw, raw, isToolCall: false };
+}
 
 describe('toggleEndpointFilter', () => {
   it('selects an endpoint when nothing is selected', () => {
@@ -19,30 +24,21 @@ describe('toggleEndpointFilter', () => {
   });
 });
 
-describe('findRequestRowIndex', () => {
-  it('returns -1 when no row matches', () => {
-    const lines = [{ requestId: 'a' }, { requestId: 'b' }];
-    expect(findRequestRowIndex(lines, 'missing')).toBe(-1);
+describe('lineKey (stable virtualizer keys)', () => {
+  it('returns the same key for the same line object across calls', () => {
+    const line = mkLine('2026-01-01T00:00:00Z INFO hello');
+    expect(lineKey(line)).toBe(lineKey(line));
   });
 
-  it('returns -1 for an empty list', () => {
-    expect(findRequestRowIndex([], 'a')).toBe(-1);
+  it('assigns distinct keys to distinct objects with identical raw text', () => {
+    const raw = '2026-01-01T00:00:00Z INFO duplicate';
+    expect(lineKey(mkLine(raw))).not.toBe(lineKey(mkLine(raw)));
   });
 
-  it('returns the latest matching index for a duplicate id', () => {
-    // Started + completed for the same JSON-RPC id produce two rows; the
-    // overlay click should scroll to the newest one (the completion row).
-    const lines = [
-      { requestId: '7' },
-      { requestId: 'other' },
-      { requestId: '7' },
-      { requestId: 'tail' },
-    ];
-    expect(findRequestRowIndex(lines, '7')).toBe(2);
-  });
-
-  it('ignores rows whose requestId is undefined', () => {
-    const lines = [{}, { requestId: '42' }, {}];
-    expect(findRequestRowIndex(lines, '42')).toBe(1);
+  it('keeps the key stable when the line moves position in a new array', () => {
+    const line = mkLine('stable');
+    const before = lineKey(line);
+    const shifted = [mkLine('newer-a'), mkLine('newer-b'), line];
+    expect(lineKey(shifted[2])).toBe(before);
   });
 });

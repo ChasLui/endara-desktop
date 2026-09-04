@@ -431,5 +431,343 @@ describe('api', () => {
       expect(callBody.body).not.toHaveProperty('server_type_override');
     });
   });
+
+  describe('startOAuth', () => {
+    // Regression coverage: the relay returns HTTP 502 with
+    // `{"error":"discovery_unreachable","detail":...}` when RFC 8414 discovery
+    // times out. It must pass through as a typed result (like dcr_unsupported /
+    // discovery_failed) so reauthorize() can show the connectivity toast — not
+    // fall into the generic non-2xx branch and throw.
+    it('returns discovery_unreachable as a typed result instead of throwing on 502', async () => {
+      const { startOAuth } = await import('./api');
+      mockHttpError(
+        502,
+        JSON.stringify({
+          error: 'discovery_unreachable',
+          detail: 'Could not reach the OAuth server to discover its endpoints.',
+        }),
+      );
+
+      const result = await startOAuth('sunsama');
+      expect(result).toEqual({
+        error: 'discovery_unreachable',
+        detail: 'Could not reach the OAuth server to discover its endpoints.',
+      });
+    });
+
+    it('returns dcr_unsupported as a typed result instead of throwing on 4xx', async () => {
+      const { startOAuth } = await import('./api');
+      // The relay's dcr_unsupported envelope uses `message` (plus endpoint
+      // metadata), not the `{ error, detail }` ErrorResponse shape used by the
+      // discovery_* errors — see OAuthDcrUnsupportedResponse in the relay.
+      mockHttpError(
+        422,
+        JSON.stringify({
+          error: 'dcr_unsupported',
+          message: 'The OAuth server does not support Dynamic Client Registration.',
+          authorization_endpoint: 'https://auth.example.com/authorize',
+        }),
+      );
+
+      const result = await startOAuth('sunsama');
+      expect(result).toEqual({
+        error: 'dcr_unsupported',
+        message: 'The OAuth server does not support Dynamic Client Registration.',
+        authorization_endpoint: 'https://auth.example.com/authorize',
+      });
+    });
+
+    it('returns discovery_failed as a typed result instead of throwing on 400', async () => {
+      const { startOAuth } = await import('./api');
+      mockHttpError(
+        400,
+        JSON.stringify({
+          error: 'discovery_failed',
+          detail: 'OAuth discovery returned an invalid metadata document.',
+        }),
+      );
+
+      const result = await startOAuth('sunsama');
+      expect(result).toEqual({
+        error: 'discovery_failed',
+        detail: 'OAuth discovery returned an invalid metadata document.',
+      });
+    });
+
+    it('throws on a 500 with an unrelated error body (generic non-2xx branch)', async () => {
+      const { startOAuth } = await import('./api');
+      mockHttpError(
+        500,
+        JSON.stringify({ error: 'internal_error', detail: 'unexpected relay failure' }),
+      );
+
+      await expect(startOAuth('sunsama')).rejects.toThrow('unexpected relay failure');
+    });
+  });
+
+  describe('oauthProbe', () => {
+    // The add-server flow relies on this probe being non-blocking: any
+    // failure/timeout/non-2xx must resolve to `{ oauth_supported: false }`
+    // (never throw) so the plain HTTP add can proceed silently.
+    it('POSTs the url to /api/oauth/probe and returns the parsed result', async () => {
+      const { oauthProbe } = await import('./api');
+      mockOk({
+        oauth_supported: true,
+        authorization_server: 'https://auth.example.com',
+        scopes_supported: ['read', 'write'],
+      });
+
+      const result = await oauthProbe('https://mcp.example.com/mcp');
+      expect(result).toEqual({
+        oauth_supported: true,
+        authorization_server: 'https://auth.example.com',
+        scopes_supported: ['read', 'write'],
+      });
+      expect(invoke).toHaveBeenCalledWith(
+        'mgmt_api_request',
+        expect.objectContaining({
+          method: 'POST',
+          path: '/api/oauth/probe',
+          body: { url: 'https://mcp.example.com/mcp' },
+        }),
+      );
+    });
+
+    it('resolves to oauth_supported:false on a non-2xx status without throwing', async () => {
+      const { oauthProbe } = await import('./api');
+      mockHttpError(500, 'Internal Server Error');
+
+      const result = await oauthProbe('https://mcp.example.com/mcp');
+      expect(result).toEqual({ oauth_supported: false });
+    });
+
+    it('resolves to oauth_supported:false on a transport error without retrying', async () => {
+      const { oauthProbe } = await import('./api');
+      vi.mocked(invoke).mockRejectedValue(new Error('socket connect failed'));
+
+      const result = await oauthProbe('https://mcp.example.com/mcp');
+      expect(result).toEqual({ oauth_supported: false });
+      // Best-effort: a single attempt, no retry loop.
+      expect(invoke).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('getIdpProviders', () => {
+    it('GETs the provider template table', async () => {
+      const { getIdpProviders } = await import('./api');
+      const mockProviders = [
+        { id: 'okta', name: 'Okta', issuer_pattern: 'https://{slug}.okta.com', slug_hint: 'subdomain' },
+        { id: 'custom', name: 'Custom' },
+      ];
+      mockOk(mockProviders);
+
+      const result = await getIdpProviders();
+      expect(result).toEqual(mockProviders);
+      expect(invoke).toHaveBeenCalledWith(
+        'mgmt_api_request',
+        expect.objectContaining({ method: 'GET', path: '/api/idp-providers' }),
+      );
+    });
+  });
+
+  describe('createOrganization', () => {
+    it('POSTs the org params and returns the SSO authorize URL', async () => {
+      const { createOrganization } = await import('./api');
+      const mockResponse = {
+        name: 'Acme Corp',
+        provider: 'okta',
+        idp: 'https://acme.okta.com',
+        authorize_url: 'https://acme.okta.com/authorize?client_id=x',
+      };
+      vi.mocked(invoke).mockResolvedValue({ status: 201, body: JSON.stringify(mockResponse) });
+
+      const params = { name: 'Acme Corp', provider: 'okta', slug: 'acme' };
+      const result = await createOrganization(params);
+      expect(result).toEqual(mockResponse);
+      expect(invoke).toHaveBeenCalledWith(
+        'mgmt_api_request',
+        expect.objectContaining({ method: 'POST', path: '/api/organizations', body: params }),
+      );
+    });
+
+    it('throws on a relay error status', async () => {
+      const { createOrganization } = await import('./api');
+      mockHttpError(409, JSON.stringify({ error: 'organization_exists' }));
+
+      await expect(
+        createOrganization({ name: 'Acme Corp', provider: 'okta', slug: 'acme' }),
+      ).rejects.toThrow('HTTP 409');
+    });
+  });
+
+  describe('listOrganizations', () => {
+    it('GETs the configured organizations with auth status', async () => {
+      const { listOrganizations } = await import('./api');
+      const mockOrgs = [
+        { name: 'Acme Corp', provider: 'okta', idp: 'https://acme.okta.com', authenticated: true },
+      ];
+      mockOk(mockOrgs);
+
+      const result = await listOrganizations();
+      expect(result).toEqual(mockOrgs);
+      expect(invoke).toHaveBeenCalledWith(
+        'mgmt_api_request',
+        expect.objectContaining({ method: 'GET', path: '/api/organizations' }),
+      );
+    });
+  });
+
+  describe('createOrganization (client_secret)', () => {
+    it('threads client_secret through the POST body', async () => {
+      const { createOrganization } = await import('./api');
+      const mockResponse = {
+        name: 'Acme Corp',
+        provider: 'okta',
+        idp: 'https://acme.okta.com',
+        authorize_url: 'https://acme.okta.com/authorize?client_id=x',
+      };
+      vi.mocked(invoke).mockResolvedValue({ status: 201, body: JSON.stringify(mockResponse) });
+
+      const params = {
+        name: 'Acme Corp',
+        provider: 'okta',
+        slug: 'acme',
+        client_id: 'abc',
+        client_secret: 's3cret',
+      };
+      await createOrganization(params);
+      expect(invoke).toHaveBeenCalledWith(
+        'mgmt_api_request',
+        expect.objectContaining({ method: 'POST', path: '/api/organizations', body: params }),
+      );
+    });
+  });
+
+  describe('updateOrganization', () => {
+    it('PUTs to the org path, URL-encoding the name', async () => {
+      const { updateOrganization } = await import('./api');
+      const mockResponse = {
+        name: 'Acme Corp',
+        provider: 'okta',
+        idp: 'https://acme.okta.com',
+        authenticated: true,
+        client_secret_set: true,
+      };
+      mockOk(mockResponse);
+
+      const params = { client_secret: 's3cret' };
+      const res = await updateOrganization('Acme Corp', params);
+      expect(res).toEqual(mockResponse);
+      expect(invoke).toHaveBeenCalledWith(
+        'mgmt_api_request',
+        expect.objectContaining({
+          method: 'PUT',
+          path: '/api/organizations/Acme%20Corp',
+          body: params,
+        }),
+      );
+    });
+
+    it('returns the reauth response shape when the relay says identity changed', async () => {
+      const { updateOrganization, updateRequiresReauth } = await import('./api');
+      const mockResponse = {
+        name: 'Acme Renamed',
+        provider: 'okta',
+        idp: 'https://acme.okta.com',
+        authorize_url: 'https://acme.okta.com/authorize?client_id=x',
+      };
+      mockOk(mockResponse);
+
+      const res = await updateOrganization('Acme Corp', { name: 'Acme Renamed' });
+      expect(res).toEqual(mockResponse);
+      expect(updateRequiresReauth(res)).toBe(true);
+    });
+
+    it('updateRequiresReauth is false when the response carries authenticated metadata', async () => {
+      const { updateRequiresReauth } = await import('./api');
+      expect(
+        updateRequiresReauth({
+          name: 'Acme',
+          provider: 'okta',
+          idp: 'https://acme.okta.com',
+          authenticated: true,
+        }),
+      ).toBe(false);
+    });
+
+    it('throws on a relay error status', async () => {
+      const { updateOrganization } = await import('./api');
+      mockHttpError(404, JSON.stringify({ error: 'not_found' }));
+      await expect(
+        updateOrganization('Acme Corp', { client_secret: '' }),
+      ).rejects.toThrow('HTTP 404');
+    });
+  });
+
+  describe('deleteOrganization', () => {
+    it('DELETEs the org, encoding the name in the path', async () => {
+      const { deleteOrganization } = await import('./api');
+      mockOk({ ok: true, name: 'Acme Corp' });
+
+      await deleteOrganization('Acme Corp');
+      expect(invoke).toHaveBeenCalledWith(
+        'mgmt_api_request',
+        expect.objectContaining({ method: 'DELETE', path: '/api/organizations/Acme%20Corp' }),
+      );
+    });
+  });
+
+  describe('reauthenticateOrganization', () => {
+    it('POSTs to the reauthenticate route and returns a fresh SSO URL', async () => {
+      const { reauthenticateOrganization } = await import('./api');
+      const mockResponse = {
+        name: 'Acme Corp',
+        provider: 'custom',
+        idp: 'https://acme.example.com',
+        authorize_url: 'https://acme.example.com/authorize?client_id=x',
+      };
+      mockOk(mockResponse);
+
+      const result = await reauthenticateOrganization('Acme Corp');
+      expect(result).toEqual(mockResponse);
+      expect(invoke).toHaveBeenCalledWith(
+        'mgmt_api_request',
+        expect.objectContaining({
+          method: 'POST',
+          path: '/api/organizations/Acme%20Corp/reauthenticate',
+        }),
+      );
+    });
+  });
+
+  describe('probeOrganization', () => {
+    it('POSTs the candidate resources and returns the per-resource results', async () => {
+      const { probeOrganization } = await import('./api');
+      const mockResponse = {
+        results: [
+          { resource: 'https://mcp.linear.app/mcp', status: 'accessible', server_as_issuer: 'https://linear.app' },
+          { resource: 'https://mcp.slack.com/mcp', status: 'denied', server_as_issuer: 'https://slack.com' },
+          { resource: 'https://mcp.asana.com/v2/mcp', status: 'unreachable' },
+        ],
+      };
+      mockOk(mockResponse);
+
+      const resources = [
+        'https://mcp.linear.app/mcp',
+        'https://mcp.slack.com/mcp',
+        'https://mcp.asana.com/v2/mcp',
+      ];
+      const result = await probeOrganization('Acme Corp', resources);
+      expect(result).toEqual(mockResponse);
+      expect(invoke).toHaveBeenCalledWith(
+        'mgmt_api_request',
+        expect.objectContaining({
+          method: 'POST',
+          path: '/api/organizations/Acme%20Corp/probe',
+          body: { resources },
+        }),
+      );
+    });
+  });
 });
 

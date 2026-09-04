@@ -1,8 +1,19 @@
 <script lang="ts">
-  import { getEndpointConfig, updateEndpoint, getEndpoints, type UpdateEndpointParams } from '$lib/api';
+  import { getEndpointConfig, updateEndpoint, getEndpoints, getStatus, type UpdateEndpointParams, type EmaAuthSummary } from '$lib/api';
   import { selectedEndpoint, endpoints, selectedEndpointData } from '$lib/stores';
   import { registerDirtyChecker } from '$lib/stores/unsavedChangesGuard';
+  import {
+    resolveIsolation,
+    isolationEnabledFromConfig,
+    parseMountRows,
+    serializeMountRows,
+    mountRowError,
+    hasMountRowErrors,
+    buildMountExample,
+    type MountRow,
+  } from './add-endpoint-helpers';
   import { sanitizeName } from '$lib/utils';
+  import { homeDir } from '@tauri-apps/api/path';
 
   type TransportType = 'stdio' | 'sse' | 'http' | 'oauth';
 
@@ -30,6 +41,14 @@
   // this state — the backend exposes only `client_secret_set: boolean`.
   let clientSecret = $state('');
   let clientSecretSet = $state(false);
+  // EMA resource (Step-3 MAS) pairing credential (R3), stored per-endpoint. The
+  // id is not a secret, so its stored value is loaded and editable; emptying it
+  // sends "" to clear. The secret is write-only — blank keeps the stored value,
+  // the "clear" toggle sends "" to drop it, and a typed value sets a new one.
+  let resourceClientId = $state('');
+  let resourceClientSecret = $state('');
+  let resourceClientSecretSet = $state(false);
+  let clearResourceSecret = $state(false);
   let scopes = $state('');
   // Optional override that replaces the upstream-reported server name in the
   // relay's connected-servers advertisement.
@@ -55,6 +74,45 @@
   // value at ≤64 chars, but pasted content can occasionally bypass that on
   // some platforms. Surface a hint if it ever happens.
   let serverTypeOverrideTooLong = $derived(serverTypeOverride.length > 64);
+  // Isolation toggle for stdio endpoints, seeded from the stored config.
+  // Empty/omitted/"none" all mean direct spawn → toggle OFF; only an explicit
+  // "container" reads ON. Saving always sends an explicit "container"/"none"
+  // value (see resolveIsolation) because the relay's PUT rebuilds the whole
+  // endpoint config from the request body.
+  let isolationEnabled = $state(false);
+  // Volume mounts (stdio + container isolation only), seeded from the stored
+  // `mounts` array. Mirrors the env-var editor; serialized on save.
+  let mountRows: MountRow[] = $state([]);
+  // EMA org-binding mirrored from the persisted `[endpoints.auth]` sub-table.
+  // Display-only in this form (the binding is configured via Add Server), but
+  // round-tripped back on save so the relay's PUT — which rebuilds the whole
+  // endpoint config from the body — doesn't drop the binding. Null/undefined
+  // for ordinary (non-EMA) endpoints, in which case no `auth` key is sent.
+  let loadedAuth = $state<EmaAuthSummary | null>(null);
+  let emaOrganization = $derived(
+    loadedAuth?.type === 'ema' ? loadedAuth.organization ?? '' : ''
+  );
+  let emaResource = $derived(
+    loadedAuth?.type === 'ema' ? loadedAuth.resource ?? '' : ''
+  );
+  let showEmaBinding = $derived(loadedAuth?.type === 'ema');
+  // The mount section only applies when the endpoint runs in a container.
+  let showMounts = $derived(transport === 'stdio' && isolationEnabled);
+  // Resolved user home directory, used to build a valid absolute-path mount
+  // example. Left null until Tauri resolves it (or on failure), so the
+  // example falls back to a generic absolute path.
+  let homeDirPath: string | null = $state(null);
+  homeDir()
+    .then((h) => { homeDirPath = h; })
+    .catch(() => { /* leave null — buildMountExample falls back */ });
+  let mountExample = $derived(buildMountExample(homeDirPath));
+  // null = unknown (older relay or status fetch failed); only an explicit
+  // `false` from the relay drives the "no runtime" inline notice.
+  let containerRuntimeAvailable: boolean | null = $state(null);
+  let runtimeMissing = $derived(containerRuntimeAvailable === false);
+  getStatus()
+    .then((s) => { containerRuntimeAvailable = s.container_runtime_available ?? null; })
+    .catch(() => { /* relay unreachable — leave runtime availability unknown */ });
 
   // The upstream-reported raw name from the relay's Lifecycle::Ready state,
   // used to preview what the override would replace. Null when the endpoint
@@ -77,8 +135,11 @@
   let originalHeaderVars = $state('[]');
   let originalOauthServerUrl = $state('');
   let originalClientId = $state('');
+  let originalResourceClientId = $state('');
   let originalScopes = $state('');
   let originalServerTypeOverride = $state('');
+  let originalIsolationEnabled = $state(false);
+  let originalMountRows = $state('[]');
 
   // Controls the Advanced <details> open state. Two-way bound so user toggles
   // stick across reactive re-renders; re-seeded from the loaded config on each
@@ -97,8 +158,11 @@
     originalHeaderVars = JSON.stringify(headerVars);
     originalOauthServerUrl = oauthServerUrl;
     originalClientId = clientId;
+    originalResourceClientId = resourceClientId.trim();
     originalScopes = scopes;
     originalServerTypeOverride = serverTypeOverride;
+    originalIsolationEnabled = isolationEnabled;
+    originalMountRows = JSON.stringify(mountRows);
     advancedOpen = originalServerTypeOverride !== '';
   }
 
@@ -107,6 +171,9 @@
   // The secret field is dirty only when the user has actually typed
   // something — the displayed placeholder/mask never counts as a change.
   let clientSecretDirty = $derived(clientSecret.trim().length > 0);
+  // The resource secret is dirty only when typed — the masked placeholder and
+  // the "clear" toggle are tracked separately below.
+  let resourceClientSecretDirty = $derived(resourceClientSecret.trim().length > 0);
 
   let isDirty = $derived(
     name !== originalName ||
@@ -123,7 +190,12 @@
     clientId !== originalClientId ||
     clientSecretDirty ||
     scopes !== originalScopes ||
-    serverTypeOverride !== originalServerTypeOverride
+    serverTypeOverride !== originalServerTypeOverride ||
+    isolationEnabled !== originalIsolationEnabled ||
+    JSON.stringify(mountRows) !== originalMountRows ||
+    resourceClientId.trim() !== originalResourceClientId ||
+    resourceClientSecretDirty ||
+    clearResourceSecret
   );
 
   // Register a dirty-checker with the shared navigation guard so that any
@@ -183,8 +255,17 @@
         // the user is never able to read or accidentally re-submit it.
         clientSecret = '';
         clientSecretSet = config.client_secret_set ?? false;
+        // EMA resource creds (R3): the id is returned and editable; the secret
+        // is never returned, so we track only whether one is stored.
+        resourceClientId = config.resource_client_id ?? '';
+        resourceClientSecret = '';
+        resourceClientSecretSet = config.resource_client_secret_set ?? false;
+        clearResourceSecret = false;
         scopes = config.scopes ?? '';
         serverTypeOverride = config.server_type_override ?? '';
+        isolationEnabled = isolationEnabledFromConfig(config.isolation);
+        mountRows = parseMountRows(config.mounts);
+        loadedAuth = config.auth ?? null;
         snapshotOriginals();
       })
       .catch(() => {
@@ -230,6 +311,18 @@
       if (args.trim()) {
         params.args = args.trim().split(/\s+/);
       }
+      // Always explicit for stdio — the relay's PUT rebuilds the endpoint
+      // config and treats an omitted field as direct spawn, so the toggle
+      // state is sent as "container"/"none", never left implicit.
+      params.isolation = resolveIsolation(transport, true, isolationEnabled);
+      // Block on any malformed mount row while the editor is visible, then
+      // always send an explicit array (possibly empty, to clear stored mounts)
+      // since the relay's PUT rebuilds the whole config from the body.
+      if (isolationEnabled && hasMountRowErrors(mountRows)) {
+        error = 'Fix the highlighted volume mount rows before saving.';
+        return;
+      }
+      params.mounts = serializeMountRows(mountRows);
     } else if (transport === 'oauth') {
       if (!url.trim()) { error = 'Server URL is required'; return; }
       params.url = url.trim();
@@ -272,6 +365,31 @@
     // typed mixed-case or whitespace.
     params.server_type_override = sanitizeName(serverTypeOverride);
 
+    // Round-trip the EMA org-binding (`[endpoints.auth]`) verbatim. The
+    // relay's PUT rebuilds the whole endpoint config from the body, so
+    // omitting `auth` would silently drop the stored binding. Non-EMA
+    // endpoints leave `loadedAuth` null and no `auth` key is sent — the PUT
+    // body stays byte-for-byte unchanged in that case.
+    if (loadedAuth) {
+      params.auth = loadedAuth;
+    }
+
+    // EMA resource (Step-3 MAS) credential (R3), persisted per-endpoint via the
+    // /credentials route. Only for EMA endpoints. `resource_client_id` is sent
+    // whenever it changed (emptied = clear, typed = set); the write-only secret
+    // is sent on an explicit clear ("") or when the user typed a new value.
+    if (showEmaBinding) {
+      const trimmedResourceClientId = resourceClientId.trim();
+      if (trimmedResourceClientId !== originalResourceClientId) {
+        params.resource_client_id = trimmedResourceClientId;
+      }
+      if (clearResourceSecret) {
+        params.resource_client_secret = '';
+      } else if (resourceClientSecretDirty) {
+        params.resource_client_secret = resourceClientSecret.trim();
+      }
+    }
+
     saving = true;
     try {
       await updateEndpoint(params);
@@ -293,6 +411,15 @@
         clientSecretSet = true;
       }
       clientSecret = '';
+      // Reflect resource-cred changes in the masked state, then reset inputs so
+      // the secret field returns to its placeholder and the clear toggle resets.
+      if (params.resource_client_secret) {
+        resourceClientSecretSet = true;
+      } else if (clearResourceSecret) {
+        resourceClientSecretSet = false;
+      }
+      resourceClientSecret = '';
+      clearResourceSecret = false;
       snapshotOriginals();
       success = 'Configuration saved';
       setTimeout(() => { success = ''; }, 3000);
@@ -338,7 +465,7 @@
           </div>
         </fieldset>
 
-        <div>
+        <div class="mt-2">
           <label for="config-ep-name" class="block text-xs font-medium mb-1 text-(--fg2)">Name</label>
           <input id="config-ep-name" type="text" bind:value={name} placeholder="my-server"
             class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
@@ -376,6 +503,61 @@
             class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
         </div>
 
+        <!-- EMA org-binding (read-only). Shown only for endpoints whose
+             `[endpoints.auth]` block is `type = "ema"`; the binding itself is
+             configured via Add Server and is preserved on save. -->
+        {#if showEmaBinding}
+          <div>
+            <span class="block text-xs font-medium mb-1 text-(--fg2)">Organization</span>
+            <div
+              class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface)/50 text-(--fg1)"
+              data-testid="config-ep-ema-organization"
+            >
+              {emaOrganization || '(unbound)'}
+            </div>
+            {#if emaResource}
+              <p class="text-[11px] text-(--fg2) mt-0.5">Resource: <code>{emaResource}</code></p>
+            {/if}
+            <p class="text-[11px] text-(--fg2) mt-0.5">
+              This server authenticates via the organization's shared sign-in. Change the binding by removing and re-adding the server.
+            </p>
+          </div>
+
+          <!-- EMA resource (Step-3 MAS) pairing credential (R3), stored
+               per-endpoint. Only for xaa.dev/Okta-style MASes that require a
+               distinct client at the ID-JAG redemption; blank for everything
+               else. The id is editable; the secret is write-only. -->
+          <div>
+            <label for="config-ep-resource-client-id" class="block text-xs font-medium mb-1 text-(--fg2)">
+              Resource Client ID <span class="text-(--fg2)/50">(optional)</span>
+            </label>
+            <input id="config-ep-resource-client-id" type="text" bind:value={resourceClientId}
+              placeholder="Resource (MAS) client ID"
+              class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
+            <p class="text-[11px] text-(--fg2) mt-0.5">
+              Only for MCP servers that require a separate client at the Step-3 token exchange. Leave blank for everything else.
+            </p>
+          </div>
+          <div>
+            <label for="config-ep-resource-client-secret" class="block text-xs font-medium mb-1 text-(--fg2)">
+              Resource Client Secret <span class="text-(--fg2)/50">(optional)</span>
+            </label>
+            <input id="config-ep-resource-client-secret" type="password" autocomplete="new-password" bind:value={resourceClientSecret}
+              placeholder={resourceClientSecretSet ? '•••••••• (stored — type to replace)' : ''}
+              disabled={clearResourceSecret}
+              class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) disabled:opacity-50" />
+            {#if resourceClientSecretSet}
+              <label class="flex items-center gap-1.5 text-[11px] text-(--fg2) mt-1 cursor-pointer">
+                <input type="checkbox" class="accent-(--accent)" bind:checked={clearResourceSecret} />
+                Clear stored resource client secret
+              </label>
+            {/if}
+            <p class="text-[11px] text-(--fg2) mt-0.5">
+              Paired with the resource client ID. Stored in the owner-scoped credential directory, separate from <code>config.toml</code>.
+            </p>
+          </div>
+        {/if}
+
         {#if transport === 'stdio'}
           <div>
             <label for="config-ep-cmd" class="block text-xs font-medium mb-1 text-(--fg2)">Command</label>
@@ -386,6 +568,31 @@
             <label for="config-ep-args" class="block text-xs font-medium mb-1 text-(--fg2)">Arguments <span class="text-(--fg2)/50">(space-separated)</span></label>
             <input id="config-ep-args" type="text" bind:value={args} placeholder="-y @modelcontextprotocol/server-filesystem /tmp"
               class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
+          </div>
+          <!-- Isolation setting (stdio only) — mirrors the toggle in AddEndpointModal. -->
+          <div>
+            <div class="flex items-center justify-between gap-2">
+              <label for="config-ep-isolation" class="text-xs font-medium text-(--fg2)">
+                Run in container <span class="text-(--fg2)/50">(isolation)</span>
+              </label>
+              <button
+                id="config-ep-isolation"
+                type="button"
+                class="tgl {isolationEnabled ? '' : 'tgl-off'}"
+                role="switch"
+                aria-checked={isolationEnabled}
+                title={isolationEnabled ? 'Disable container isolation' : 'Enable container isolation'}
+                onclick={() => isolationEnabled = !isolationEnabled}
+              ><span></span></button>
+            </div>
+            <p class="text-[11px] text-(--fg2) mt-0.5">
+              Runs the server in an isolated container (Docker or Podman) instead of directly on your machine.
+            </p>
+            {#if runtimeMissing && isolationEnabled}
+              <p class="text-[11px] text-(--attention) mt-1">
+                No container runtime detected — the server will fall back to running directly on your machine. Install Docker or Podman to enable isolation.
+              </p>
+            {/if}
           </div>
         {:else if transport === 'oauth'}
           <div>
@@ -494,6 +701,49 @@
             </div>
           {/each}
         </div>
+
+        <!-- Volume mounts (containerized stdio only) — host/container bind
+             pairs sent to the relay as `mounts: string[]`. -->
+        {#if showMounts}
+          <div>
+            <div class="flex items-center justify-between mb-1">
+              <span class="block text-xs font-medium text-(--fg2)">
+                Volume mounts
+                <span class="text-(--fg2)/50">(optional)</span>
+              </span>
+              <button
+                type="button"
+                class="text-xs text-(--accent) hover:text-(--accent-hover)"
+                onclick={() => mountRows = [...mountRows, { host: '', container: '' }]}
+              >
+                + Add
+              </button>
+            </div>
+            {#each mountRows as mount, i}
+              {@const rowError = mountRowError(mount)}
+              <div class="flex gap-1 mb-1">
+                <input type="text" bind:value={mount.host} placeholder="/host/path"
+                  aria-invalid={!!rowError}
+                  class="flex-1 text-sm px-2 py-1 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) font-mono {rowError ? 'border-(--offline)' : 'border-(--border)'}" />
+                <span class="self-center text-xs text-(--fg2)">:</span>
+                <input type="text" bind:value={mount.container} placeholder="/container/path"
+                  aria-invalid={!!rowError}
+                  class="flex-1 text-sm px-2 py-1 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) font-mono {rowError ? 'border-(--offline)' : 'border-(--border)'}" />
+                <button
+                  type="button"
+                  class="text-xs px-1.5 text-(--fg2) hover:text-(--offline)"
+                  onclick={() => mountRows = mountRows.filter((_, idx) => idx !== i)}
+                >✕</button>
+              </div>
+              {#if rowError}
+                <p class="text-[11px] text-(--offline) mb-1">{rowError}</p>
+              {/if}
+            {/each}
+            <p class="text-[11px] text-(--fg2) mt-0.5">
+              Bind host paths into the container, e.g. <code>{mountExample}</code>.
+            </p>
+          </div>
+        {/if}
 
         <!-- HTTP Headers (SSE/HTTP only) -->
         {#if transport !== 'stdio'}
@@ -621,5 +871,35 @@
     font-size: 12px;
     font-weight: 500;
     color: var(--fg2);
+  }
+  /* Toggle pill (36x20) — mirrors the enable/disable switch in DetailPanel */
+  .tgl {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    border-radius: 999px;
+    background: var(--healthy);
+    border: 0;
+    cursor: pointer;
+    padding: 0;
+    flex-shrink: 0;
+    transition: background-color 150ms var(--ease);
+  }
+  .tgl.tgl-off {
+    background: var(--toggle-off);
+  }
+  .tgl > span {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: 999px;
+    background: #fff;
+    box-shadow: 0 1px 2px var(--scrim);
+    transition: transform 150ms var(--ease);
+  }
+  .tgl:not(.tgl-off) > span {
+    transform: translateX(16px);
   }
 </style>

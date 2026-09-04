@@ -4,6 +4,12 @@ export interface CatalogEnvVar {
   required: boolean;
   secret: boolean;
   helpUrl?: string;
+  /**
+   * When set, the configured value is sent as the HTTP header `name` (prefixed
+   * with `valuePrefix`, e.g. `"Bearer "`) instead of as an environment variable.
+   * Only meaningful for `http`/`sse` entries.
+   */
+  header?: { name: string; valuePrefix?: string };
 }
 
 export interface CatalogServer {
@@ -13,8 +19,12 @@ export interface CatalogServer {
   icon: string;
   category: 'developer' | 'search' | 'productivity' | 'data';
   transport: 'stdio' | 'sse' | 'http';
-  command: string;
-  args: string[];
+  /** Remote endpoint URL. Required for `http`/`sse` transports (unused for `stdio`). */
+  url?: string;
+  /** Executable to spawn. Required for `stdio` transports (unused for `http`/`sse`). */
+  command?: string;
+  /** Arguments passed to `command`. Required for `stdio` transports (unused for `http`/`sse`). */
+  args?: string[];
   envVars: CatalogEnvVar[];
   userArgs?: { label: string; placeholder: string; type?: 'directory' | 'file' }[];
   /**
@@ -23,6 +33,14 @@ export interface CatalogServer {
    * digits, `-`, `_` only (mirrors the relay's `sanitize_server_name`).
    */
   serverTypeOverride?: string;
+  /**
+   * Set to `false` for entries that must not run in a container. The add flow
+   * shows a "Not containerized" badge, hides the isolation toggle, and writes
+   * `isolation = "none"`. Absent means the entry containerizes by default.
+   */
+  containerizable?: false;
+  /** Short user-facing reason shown alongside the "Not containerized" badge. */
+  containerNote?: string;
 }
 
 export const CATALOG_SERVERS: CatalogServer[] = [
@@ -37,6 +55,8 @@ export const CATALOG_SERVERS: CatalogServer[] = [
     args: ['-y', '@modelcontextprotocol/server-filesystem'],
     envVars: [],
     userArgs: [{ label: 'Allowed directory', placeholder: '/Users/you/projects', type: 'directory' }],
+    containerizable: false,
+    containerNote: 'Needs direct access to your local filesystem.',
   },
   {
     id: 'github',
@@ -44,11 +64,17 @@ export const CATALOG_SERVERS: CatalogServer[] = [
     description: 'Interact with GitHub repositories, issues, pull requests, and more.',
     icon: '<svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 1.5a8.5 8.5 0 0 0-2.69 16.56c.43.08.58-.18.58-.4v-1.54c-2.37.52-2.87-1.01-2.87-1.01-.39-.99-.95-1.25-.95-1.25-.78-.53.06-.52.06-.52.86.06 1.31.88 1.31.88.76 1.3 2 .93 2.49.71.08-.55.3-.93.54-1.14-1.89-.21-3.88-.94-3.88-4.2 0-.93.33-1.69.88-2.28-.09-.22-.38-1.08.08-2.25 0 0 .72-.23 2.35.87a8.18 8.18 0 0 1 4.28 0c1.63-1.1 2.35-.87 2.35-.87.46 1.17.17 2.03.08 2.25.55.59.88 1.35.88 2.28 0 3.27-1.99 3.99-3.89 4.2.31.26.58.78.58 1.58v2.34c0 .22.15.49.58.4A8.5 8.5 0 0 0 10 1.5Z"/></svg>',
     category: 'developer',
-    transport: 'stdio',
-    command: 'npx',
-    args: ['-y', '@modelcontextprotocol/server-github'],
+    transport: 'http',
+    url: 'https://api.githubcopilot.com/mcp/',
     envVars: [
-      { name: 'GITHUB_PERSONAL_ACCESS_TOKEN', label: 'Personal Access Token', required: true, secret: true, helpUrl: 'https://github.com/settings/tokens' },
+      {
+        name: 'GITHUB_PERSONAL_ACCESS_TOKEN',
+        label: 'Personal Access Token',
+        required: true,
+        secret: true,
+        helpUrl: 'https://github.com/settings/tokens',
+        header: { name: 'Authorization', valuePrefix: 'Bearer ' },
+      },
     ],
   },
   {
@@ -87,6 +113,8 @@ export const CATALOG_SERVERS: CatalogServer[] = [
     command: 'npx',
     args: ['-y', '@modelcontextprotocol/server-puppeteer'],
     envVars: [],
+    containerizable: false,
+    containerNote: 'Needs a host browser (Chromium) that the container image does not include.',
   },
   {
     id: 'memory',
@@ -98,6 +126,8 @@ export const CATALOG_SERVERS: CatalogServer[] = [
     command: 'npx',
     args: ['-y', '@modelcontextprotocol/server-memory'],
     envVars: [],
+    containerizable: false,
+    containerNote: 'Stores its knowledge graph in a file that would be lost when the container restarts.',
   },
   {
     id: 'sequential-thinking',

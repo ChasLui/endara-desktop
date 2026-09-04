@@ -7,10 +7,13 @@
 <script lang="ts">
   import type { ToastStore } from './toastStore';
   import {
+    collectHitRects,
     hiddenGroupCount,
+    latestRequest,
     visibleGroups,
     type OverlayPosition,
   } from './overlay-helpers';
+  import { reportOverlayHitRects } from './overlay-actions';
   import OverlayCard from './OverlayCard.svelte';
   import { fade, fly } from 'svelte/transition';
   import { quintOut } from 'svelte/easing';
@@ -21,6 +24,7 @@
     maxVisible?: number;
     cardWidth?: number;
     showProfile?: boolean;
+    dismissMs?: number;
   };
   let {
     store,
@@ -28,6 +32,7 @@
     maxVisible = 7,
     cardWidth = 340,
     showProfile = true,
+    dismissMs = 6000,
   }: Props = $props();
 
   const groups = $derived($store);
@@ -36,11 +41,14 @@
 
   // Per-card dismiss bar lives inside `OverlayCard` and reads its
   // timing state from `group.dismissTick` + `group.inflight`/
-  // `group.success`/`group.error`. The duration captured by the
-  // matching `setTimeout` in `toastStore` is exposed via
-  // `store.getOpts().dismissMs` and piped down so the CSS keyframe
-  // and the JS timeout stay aligned.
-  const dismissDurationMs = $derived(store.getOpts().dismissMs);
+  // `group.success`/`group.error`. An armed group carries the exact
+  // duration its per-group `setTimeout` was armed with on
+  // `group.dismissDurationMs`, and the card's CSS keyframe reads THAT —
+  // so the bar and the timer can never desync mid-countdown. This piped
+  // `dismissMs` (the live `$overlaySettings.auto_dismiss_ms` from
+  // `OverlayApp`) is forwarded only as the card's fallback default for
+  // groups that are not currently counting down.
+  const dismissDurationMs = $derived(dismissMs);
 
   // Right-anchored corners slide in/out toward +x, left-anchored toward
   // −x. The transition directives live on the `.tf-feed-inner` container
@@ -72,6 +80,54 @@
   const outDuration = reducedMotion ? 100 : 200;
   const inX = $derived(reducedMotion ? 0 : slideDir * slidePx);
   const outX = $derived(reducedMotion ? 0 : slideDir * slidePx);
+
+  // ---- Hit-rect reporting --------------------------------------------------
+  // Measure the visible card slots and report their bounding rects to the
+  // Rust-side cursor poller (`set_overlay_hit_rects`). The poller — not a
+  // renderer pointer handler — toggles the window's ignore-cursor-events
+  // flag, because a click-through window receives no pointer events from
+  // the OS. An empty report idles the poller and restores click-through.
+  //
+  // Two-step measurement: a rAF captures the new layout as soon as it
+  // exists, and a delayed re-measure after the slide/fade transitions have
+  // settled (`inDuration` + margin) captures the final card positions (the
+  // feed-level fly translates the whole stack horizontally while animating).
+  let feedEl: HTMLElement | null = $state(null);
+  let measureRaf = 0;
+  let settleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function measureAndReport() {
+    const slots = feedEl ? feedEl.querySelectorAll('.tf-card-slot') : [];
+    void reportOverlayHitRects(collectHitRects(slots));
+  }
+
+  function scheduleHitRectMeasure() {
+    if (typeof window === 'undefined') return;
+    cancelAnimationFrame(measureRaf);
+    measureRaf = requestAnimationFrame(measureAndReport);
+    clearTimeout(settleTimer);
+    settleTimer = setTimeout(measureAndReport, inDuration + 120);
+  }
+
+  // Re-measure whenever the visible card list (or the "+N earlier" row)
+  // changes. The settle-timer pass also covers the 1 → 0 case where the
+  // out-transition keeps slot elements in the DOM briefly.
+  $effect(() => {
+    void visible;
+    void hidden;
+    scheduleHitRectMeasure();
+  });
+
+  // Re-measure on window resize (monitor / scale changes move the cards).
+  $effect(() => {
+    const onResize = () => scheduleHitRectMeasure();
+    window.addEventListener('resize', onResize);
+    return () => {
+      window.removeEventListener('resize', onResize);
+      cancelAnimationFrame(measureRaf);
+      clearTimeout(settleTimer);
+    };
+  });
 </script>
 
 <div
@@ -79,6 +135,7 @@
   data-position={position}
   data-testid="toast-feed"
   style:--tf-card-w="{cardWidth}px"
+  bind:this={feedEl}
 >
   {#if visible.length > 0}
     <div
@@ -91,7 +148,11 @@
         <div class="tf-more" data-testid="more-earlier">+{hidden} earlier</div>
       {/if}
       {#each visible as g (g.id)}
-        <div class="tf-card-slot" in:fade={{ duration: 120 }}>
+        <div
+          class="tf-card-slot"
+          data-log-id={latestRequest(g)?.logId ?? ''}
+          in:fade={{ duration: 120 }}
+        >
           <OverlayCard group={g} {showProfile} {dismissDurationMs} />
         </div>
       {/each}

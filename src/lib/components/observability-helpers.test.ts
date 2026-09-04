@@ -1,0 +1,425 @@
+import { describe, it, expect, vi } from 'vitest';
+
+import type { CallSummaryDto, AggregateBucketDto } from '$lib/types';
+import {
+  DEFAULT_OVERSCAN,
+  DEFAULT_ROW_ESTIMATE_PX,
+  computeMountedRange,
+} from './virtual-log-list-helpers';
+import {
+  buildCallsFilter,
+  formatDuration,
+  formatBytes,
+  formatTime,
+  callStatus,
+  globalBuckets,
+  bucketSeries,
+  sparklinePoints,
+  combinedDomain,
+  nearestIndex,
+  debounce,
+  isTerminalEvent,
+  mergeCalls,
+  distinctValues,
+  prettyJson,
+  parseJsonTree,
+  expandToDepth,
+  INLINE_PAYLOAD_MAX_CHARS,
+  type CallsFilterUi,
+} from './observability-helpers';
+
+const baseUi: CallsFilterUi = {
+  serverName: '',
+  tool: '',
+  status: 'all',
+  windowMinutes: 0,
+  requestUid: '',
+  limit: 100,
+};
+
+function call(p: Partial<CallSummaryDto>): CallSummaryDto {
+  return {
+    id: 1,
+    requestUid: 'u1',
+    serverName: 'github',
+    tool: 'get_file',
+    tsStart: 1000,
+    durationMs: 0,
+    success: true,
+    requestBytes: 0,
+    responseBytes: 0,
+    ...p,
+  };
+}
+
+describe('buildCallsFilter', () => {
+  it('omits empty server/tool and leaves success/cursor unset for "all"', () => {
+    expect(buildCallsFilter(baseUi)).toEqual({ limit: 100 });
+  });
+
+  it('maps trimmed server/tool and the success tri-state', () => {
+    expect(buildCallsFilter({ ...baseUi, serverName: ' github ', tool: ' foo ', status: 'errors' })).toEqual({
+      limit: 100,
+      server_name: 'github',
+      tool: 'foo',
+      success: false,
+    });
+    expect(buildCallsFilter({ ...baseUi, status: 'success' }).success).toBe(true);
+  });
+
+  it('derives a since bound from the window using injected now', () => {
+    const f = buildCallsFilter({ ...baseUi, windowMinutes: 5 }, 1_000_000);
+    expect(f.since).toBe(1_000_000 - 5 * 60_000);
+  });
+
+  it('maps a trimmed requestUid to request_uid and drops it when empty', () => {
+    expect(buildCallsFilter({ ...baseUi, requestUid: ' abc-123 ' }).request_uid).toBe('abc-123');
+    expect(buildCallsFilter({ ...baseUi, requestUid: '   ' }).request_uid).toBeUndefined();
+    expect(buildCallsFilter(baseUi).request_uid).toBeUndefined();
+  });
+
+  it('forwards an opaque cursor when present and drops it when undefined', () => {
+    expect(buildCallsFilter({ ...baseUi, cursor: 'opaque-token' }).cursor).toBe('opaque-token');
+    expect(buildCallsFilter(baseUi).cursor).toBeUndefined();
+  });
+});
+
+describe('formatters', () => {
+  it('formatDuration', () => {
+    expect(formatDuration(312)).toBe('312 ms');
+    expect(formatDuration(1500)).toBe('1.50 s');
+    expect(formatDuration(undefined)).toBe('—');
+  });
+
+  it('formatBytes', () => {
+    expect(formatBytes(512)).toBe('512 B');
+    expect(formatBytes(2048)).toBe('2.0 KB');
+    expect(formatBytes(-1)).toBe('—');
+    expect(formatBytes(null)).toBe('—');
+  });
+
+  it('formatTime guards bad input', () => {
+    expect(formatTime(undefined)).toBe('—');
+    expect(formatTime(NaN)).toBe('—');
+    expect(typeof formatTime(1000)).toBe('string');
+  });
+});
+
+describe('callStatus', () => {
+  it('labels success and error with message', () => {
+    expect(callStatus(call({ success: true }))).toEqual({ ok: true, label: 'success' });
+    expect(callStatus(call({ success: false, errorMessage: 'boom' }))).toEqual({
+      ok: false,
+      label: 'error',
+    });
+    expect(callStatus(call({ success: false }))).toEqual({ ok: false, label: 'error' });
+  });
+});
+
+describe('aggregate buckets', () => {
+  const buckets: AggregateBucketDto[] = [
+    { server: 'github', bucketStart: 2, count: 1, errorCount: 0, p50Ms: 5, p95Ms: 9 },
+    { bucketStart: 2, count: 3, errorCount: 1, p50Ms: 7, p95Ms: 20 },
+    { bucketStart: 1, count: 2, errorCount: 0, p50Ms: 4, p95Ms: 6 },
+  ];
+
+  it('globalBuckets keeps only server-less buckets, sorted by start', () => {
+    const g = globalBuckets(buckets);
+    expect(g.map((b) => b.bucketStart)).toEqual([1, 2]);
+  });
+
+  it('bucketSeries extracts a field', () => {
+    expect(bucketSeries(globalBuckets(buckets), 'count')).toEqual([2, 3]);
+    expect(bucketSeries(globalBuckets(buckets), 'errorCount')).toEqual([0, 1]);
+  });
+});
+
+describe('sparklinePoints', () => {
+  it('returns empty string for no data', () => {
+    expect(sparklinePoints([], { width: 100, height: 20 })).toBe('');
+  });
+
+  it('centres a single value', () => {
+    expect(sparklinePoints([5], { width: 100, height: 20, padding: 1 })).toBe('1,10.00 99.00,10.00');
+  });
+
+  it('maps min to bottom and max to top', () => {
+    const pts = sparklinePoints([0, 10], { width: 10, height: 10, padding: 0 }).split(' ');
+    expect(pts[0]).toBe('0.00,10.00');
+    expect(pts[1]).toBe('10.00,0.00');
+  });
+
+  it('honours a shared domain so series are comparable', () => {
+    // With a shared [0,10] domain, the value 5 sits at the vertical midpoint
+    // (y = 5 of a height-10 box) instead of being stretched to its own range.
+    const pts = sparklinePoints([0, 5], { width: 10, height: 10, padding: 0, min: 0, max: 10 }).split(
+      ' ',
+    );
+    expect(pts[0]).toBe('0.00,10.00');
+    expect(pts[1]).toBe('10.00,5.00');
+  });
+});
+
+describe('combinedDomain', () => {
+  it('spans the min/max across all series', () => {
+    expect(combinedDomain([[1, 9], [4, 20]])).toEqual({ min: 1, max: 20 });
+  });
+
+  it('returns a zero domain for empty input', () => {
+    expect(combinedDomain([])).toEqual({ min: 0, max: 0 });
+    expect(combinedDomain([[], []])).toEqual({ min: 0, max: 0 });
+  });
+});
+
+describe('nearestIndex', () => {
+  it('maps the hover ratio to the nearest bucket index', () => {
+    expect(nearestIndex(0, 5)).toBe(0);
+    expect(nearestIndex(1, 5)).toBe(4);
+    expect(nearestIndex(0.5, 5)).toBe(2);
+    // Rounds to the nearest: 0.6 * 4 = 2.4 → 2; 0.7 * 4 = 2.8 → 3.
+    expect(nearestIndex(0.6, 5)).toBe(2);
+    expect(nearestIndex(0.7, 5)).toBe(3);
+  });
+
+  it('clamps out-of-range ratios into [0, length - 1]', () => {
+    expect(nearestIndex(-0.5, 5)).toBe(0);
+    expect(nearestIndex(1.5, 5)).toBe(4);
+  });
+
+  it('returns 0 for empty, single-point, or non-finite input', () => {
+    expect(nearestIndex(0.5, 0)).toBe(0);
+    expect(nearestIndex(0.5, 1)).toBe(0);
+    expect(nearestIndex(Number.NaN, 5)).toBe(0);
+  });
+});
+
+describe('debounce', () => {
+  it('collapses a burst into one trailing call', () => {
+    vi.useFakeTimers();
+    try {
+      const fn = vi.fn();
+      const d = debounce(fn, 250);
+      d();
+      d();
+      d();
+      expect(fn).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(250);
+      expect(fn).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancel() prevents a pending call', () => {
+    vi.useFakeTimers();
+    try {
+      const fn = vi.fn();
+      const d = debounce(fn, 250);
+      d();
+      d.cancel();
+      vi.advanceTimersByTime(500);
+      expect(fn).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('live event merging', () => {
+  it('isTerminalEvent only for completed/failed', () => {
+    expect(isTerminalEvent({ kind: 'completed' })).toBe(true);
+    expect(isTerminalEvent({ kind: 'failed' })).toBe(true);
+    expect(isTerminalEvent({ kind: 'started' })).toBe(false);
+    expect(isTerminalEvent(null)).toBe(false);
+  });
+
+  it('mergeCalls dedupes by requestUid (incoming wins) newest-first', () => {
+    const existing = [call({ requestUid: 'a', tsStart: 1000, tool: 'old' })];
+    const incoming = [
+      call({ requestUid: 'a', tsStart: 1000, tool: 'new' }),
+      call({ requestUid: 'b', tsStart: 3000 }),
+    ];
+    const merged = mergeCalls(existing, incoming);
+    expect(merged.map((c) => c.requestUid)).toEqual(['b', 'a']);
+    expect(merged[1].tool).toBe('new');
+  });
+
+  it('mergeCalls without a cap keeps all rows', () => {
+    const existing = [call({ requestUid: 'a', tsStart: 1000 })];
+    const incoming = [call({ requestUid: 'b', tsStart: 2000 })];
+    expect(mergeCalls(existing, incoming)).toHaveLength(2);
+  });
+
+  it('mergeCalls caps to the newest maxRows rows', () => {
+    const existing = [
+      call({ requestUid: 'a', tsStart: 1000 }),
+      call({ requestUid: 'b', tsStart: 2000 }),
+    ];
+    const incoming = [
+      call({ requestUid: 'c', tsStart: 4000 }),
+      call({ requestUid: 'd', tsStart: 3000 }),
+    ];
+    const merged = mergeCalls(existing, incoming, 3);
+    expect(merged.map((c) => c.requestUid)).toEqual(['c', 'd', 'b']);
+  });
+
+  it('mergeCalls cap still lets incoming rows refresh surviving UIDs', () => {
+    const existing = [
+      call({ requestUid: 'a', tsStart: 1000 }),
+      call({ requestUid: 'b', tsStart: 2000, tool: 'old' }),
+    ];
+    const incoming = [
+      call({ requestUid: 'b', tsStart: 2000, tool: 'new' }),
+      call({ requestUid: 'c', tsStart: 3000 }),
+    ];
+    const merged = mergeCalls(existing, incoming, 2);
+    expect(merged.map((c) => c.requestUid)).toEqual(['c', 'b']);
+    expect(merged[1].tool).toBe('new');
+  });
+
+  it('mergeCalls ignores non-positive or non-finite caps', () => {
+    const existing = [call({ requestUid: 'a', tsStart: 1000 })];
+    const incoming = [call({ requestUid: 'b', tsStart: 2000 })];
+    expect(mergeCalls(existing, incoming, 0)).toHaveLength(2);
+    expect(mergeCalls(existing, incoming, -5)).toHaveLength(2);
+    expect(mergeCalls(existing, incoming, NaN)).toHaveLength(2);
+    expect(mergeCalls(existing, incoming, Infinity)).toHaveLength(2);
+  });
+
+  it('mergeCalls cap at exactly the merged length keeps everything', () => {
+    const existing = [call({ requestUid: 'a', tsStart: 1000 })];
+    const incoming = [call({ requestUid: 'b', tsStart: 2000 })];
+    expect(mergeCalls(existing, incoming, 2)).toHaveLength(2);
+  });
+
+  it('distinctValues returns sorted unique field values', () => {
+    const calls = [call({ serverName: 'b' }), call({ serverName: 'a' }), call({ serverName: 'a' })];
+    expect(distinctValues(calls, 'serverName')).toEqual(['a', 'b']);
+  });
+});
+
+describe('prettyJson', () => {
+  it('pretty-prints valid JSON', () => {
+    expect(prettyJson('{"a":1}').text).toBe('{\n  "a": 1\n}');
+  });
+
+  it('falls back to raw text and flags truncation', () => {
+    expect(prettyJson('not json').text).toBe('not json');
+    const big = prettyJson('x'.repeat(50), 10);
+    expect(big.truncated).toBe(true);
+    expect(big.text).toHaveLength(10);
+  });
+
+  it('skips parsing when raw far exceeds maxChars (returns truncated raw)', () => {
+    const huge = JSON.stringify({ a: 'y'.repeat(900_000) });
+    const out = prettyJson(huge); // default 200k cap; 900k > 200k * 4
+    expect(out.truncated).toBe(true);
+    expect(out.text).toHaveLength(200_000);
+    // Not pretty-printed (a parsed object would start with '{\n  "a"').
+    expect(out.text.startsWith('{"a":')).toBe(true);
+  });
+
+  it('skips parsing past the absolute ceiling even with an unbounded cap (copy path)', () => {
+    const huge = JSON.stringify({ a: 'z'.repeat(2_000_000) });
+    const out = prettyJson(huge, Number.MAX_SAFE_INTEGER);
+    expect(out.truncated).toBe(true);
+    expect(out.text.length).toBeLessThanOrEqual(1_000_000);
+    expect(out.text.startsWith('{"a":')).toBe(true);
+  });
+});
+
+describe('parseJsonTree', () => {
+  it('parses JSON objects and arrays for the tree viewer', () => {
+    expect(parseJsonTree('{"a":1}')).toEqual({ ok: true, value: { a: 1 } });
+    expect(parseJsonTree('[1,2]')).toEqual({ ok: true, value: [1, 2] });
+  });
+
+  it('falls back for non-JSON, empty, primitives, and oversized text', () => {
+    expect(parseJsonTree('not json')).toEqual({ ok: false });
+    expect(parseJsonTree('')).toEqual({ ok: false });
+    expect(parseJsonTree('null')).toEqual({ ok: false });
+    expect(parseJsonTree('42')).toEqual({ ok: false });
+    expect(parseJsonTree('"a string"')).toEqual({ ok: false });
+    expect(parseJsonTree('{"a":1}', 3)).toEqual({ ok: false });
+  });
+});
+
+// The Observability call list renders rows through VirtualLogList in
+// top-anchored mode (followTail: false). The test env is Node (no jsdom), so
+// — per the established pattern (see RelayLogs.test.ts) — the mounted-row
+// assertions run against computeMountedRange, the pure mirror of the
+// virtualizer's windowing math under the list's actual estimate/overscan
+// configuration.
+describe('virtualized call list window (large "Load more" backlog)', () => {
+  const base = { rowHeight: DEFAULT_ROW_ESTIMATE_PX, overscan: DEFAULT_OVERSCAN };
+  const count = 500;
+
+  it('mounts only the top window (+overscan) on first render (top-anchored)', () => {
+    const viewportHeight = 600;
+    const range = computeMountedRange({ ...base, count, scrollOffset: 0, viewportHeight });
+    expect(range!.start).toBe(0);
+    const mounted = range!.end - range!.start + 1;
+    expect(mounted).toBe(viewportHeight / DEFAULT_ROW_ESTIMATE_PX + DEFAULT_OVERSCAN);
+    expect(mounted).toBeLessThan(count / 10);
+  });
+
+  it('keeps the mounted subset windowed while scrolled mid-list', () => {
+    const viewportHeight = 600;
+    const range = computeMountedRange({
+      ...base,
+      count,
+      scrollOffset: (count / 2) * DEFAULT_ROW_ESTIMATE_PX,
+      viewportHeight,
+    });
+    expect(range!.start).toBeGreaterThan(0);
+    expect(range!.end).toBeLessThan(count - 1);
+    const mounted = range!.end - range!.start + 1;
+    expect(mounted).toBe(viewportHeight / DEFAULT_ROW_ESTIMATE_PX + 2 * DEFAULT_OVERSCAN);
+  });
+
+  // NOTE: this documents the pure mirror's model, not the component's literal
+  // hidden-tab DOM — the real TanStack virtualizer still mounts ~1 + overscan
+  // rows at clientHeight === 0 (its range math never yields an empty window).
+  it('mounts nothing while the tab is hidden (zero-height viewport)', () => {
+    const range = computeMountedRange({ ...base, count, scrollOffset: 0, viewportHeight: 0 });
+    expect(range).toBeNull();
+  });
+});
+
+describe('inline payload budget', () => {
+  it('is far below the default 200k caps', () => {
+    expect(INLINE_PAYLOAD_MAX_CHARS).toBe(20_000);
+    expect(INLINE_PAYLOAD_MAX_CHARS).toBeLessThan(200_000);
+  });
+
+  it('parseJsonTree rejects payloads over the inline budget but accepts them at the default cap', () => {
+    const mid = JSON.stringify({ a: 'x'.repeat(INLINE_PAYLOAD_MAX_CHARS) });
+    expect(parseJsonTree(mid, INLINE_PAYLOAD_MAX_CHARS)).toEqual({ ok: false });
+    expect(parseJsonTree(mid).ok).toBe(true);
+  });
+
+  it('prettyJson truncates the inline view to the inline budget', () => {
+    const mid = JSON.stringify({ a: 'x'.repeat(INLINE_PAYLOAD_MAX_CHARS) });
+    const out = prettyJson(mid, INLINE_PAYLOAD_MAX_CHARS);
+    expect(out.truncated).toBe(true);
+    expect(out.text.length).toBeLessThanOrEqual(INLINE_PAYLOAD_MAX_CHARS);
+    expect(prettyJson(mid).truncated).toBe(false);
+  });
+});
+
+describe('expandToDepth', () => {
+  it('expands only levels below the given depth (root = level 0)', () => {
+    const depth2 = expandToDepth(2);
+    expect(depth2(0)).toBe(true);
+    expect(depth2(1)).toBe(true);
+    expect(depth2(2)).toBe(false);
+    expect(depth2(3)).toBe(false);
+  });
+
+  it('depth 0 collapses everything; depth 1 matches collapseAllNested semantics', () => {
+    expect(expandToDepth(0)(0)).toBe(false);
+    const depth1 = expandToDepth(1);
+    expect(depth1(0)).toBe(true);
+    expect(depth1(1)).toBe(false);
+  });
+});

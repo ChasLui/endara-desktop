@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import addEndpointModalSource from './AddEndpointModal.svelte?raw';
 import { sanitizeName } from '$lib/utils';
 import { CATALOG_SERVERS, type CatalogServer } from '$lib/catalog';
 import { oauthCatalog, type OAuthCatalogEntry } from '$lib/data/oauth-catalog';
@@ -11,8 +12,21 @@ import {
   validateAddEndpointForm,
   firstAddEndpointFieldError,
   computeAddEndpointIsDirty,
+  resolveIsolation,
+  isolationEnabledFromConfig,
+  parseMountRows,
+  serializeMountRows,
+  mountRowError,
+  hasMountRowErrors,
+  buildMountExample,
+  buildOrgBoundEndpointParams,
+  orgBindingApplies,
+  buildCatalogEnvAndHeaders,
+  mergeHeaders,
+  MOUNT_EXAMPLE_FALLBACK_HOST,
   type AddEndpointFieldErrors,
   type AddEndpointFormSnapshot,
+  type MountRow,
 } from './add-endpoint-helpers';
 
 // `sanitizeName` mirrors the relay's `sanitize_server_name`
@@ -722,7 +736,12 @@ describe('computeAddEndpointIsDirty', () => {
       clientId: '',
       clientSecret: '',
       scopes: '',
+      orgBoundScopes: '',
+      resourceClientId: '',
+      resourceClientSecret: '',
       serverTypeOverride: '',
+      isolationEnabled: true,
+      mounts: [],
       ...overrides,
     };
   }
@@ -733,10 +752,12 @@ describe('computeAddEndpointIsDirty', () => {
   });
 
   it('returns false against a catalog-prefilled baseline that is unchanged', () => {
+    // Mirrors the http GitHub catalog entry: URL prefilled, no command/args.
     const snap = makeSnapshot({
       name: 'GitHub',
-      command: 'npx',
-      args: '-y @modelcontextprotocol/server-github',
+      command: '',
+      args: '',
+      url: 'https://api.githubcopilot.com/mcp/',
       description: 'Code hosting and collaboration',
     });
     expect(computeAddEndpointIsDirty(snap, { ...snap })).toBe(false);
@@ -754,6 +775,9 @@ describe('computeAddEndpointIsDirty', () => {
       'clientId',
       'clientSecret',
       'scopes',
+      'orgBoundScopes',
+      'resourceClientId',
+      'resourceClientSecret',
       'serverTypeOverride',
     ];
     for (const key of cases) {
@@ -819,6 +843,667 @@ describe('computeAddEndpointIsDirty', () => {
     const snap = makeSnapshot({ userArgValues: [''] });
     const current = makeSnapshot({ userArgValues: ['', ''] });
     expect(computeAddEndpointIsDirty(snap, current)).toBe(true);
+  });
+
+  it('flags the isolation toggle when flipped away from the snapshot', () => {
+    const snap = makeSnapshot();
+    expect(computeAddEndpointIsDirty(snap, makeSnapshot({ isolationEnabled: false }))).toBe(true);
+    expect(computeAddEndpointIsDirty(snap, makeSnapshot({ isolationEnabled: true }))).toBe(false);
+  });
+
+  it('flags mount rows when added, edited, or removed', () => {
+    const snap = makeSnapshot();
+    expect(
+      computeAddEndpointIsDirty(snap, makeSnapshot({ mounts: [{ host: '', container: '' }] })),
+    ).toBe(true);
+    const withMount = makeSnapshot({ mounts: [{ host: '/a', container: '/b' }] });
+    expect(
+      computeAddEndpointIsDirty(withMount, makeSnapshot({ mounts: [{ host: '/a', container: '/c' }] })),
+    ).toBe(true);
+    expect(computeAddEndpointIsDirty(withMount, makeSnapshot({ mounts: [] }))).toBe(true);
+  });
+
+  it('returns false when mount rows match element-for-element', () => {
+    const snap = makeSnapshot({ mounts: [{ host: '/a', container: '/b' }] });
+    const current = makeSnapshot({ mounts: [{ host: '/a', container: '/b' }] });
+    expect(computeAddEndpointIsDirty(snap, current)).toBe(false);
+  });
+});
+
+// Volume-mount editor helpers — parse stored `mounts: string[]` into rows,
+// validate the two-input host/container pairs, and serialize back to the
+// relay's `host:container` array form.
+describe('mount row helpers', () => {
+  it('parseMountRows splits each entry on its first colon and trims', () => {
+    expect(parseMountRows(['~/.gmail-mcp:/home/node/.gmail-mcp'])).toEqual([
+      { host: '~/.gmail-mcp', container: '/home/node/.gmail-mcp' },
+    ]);
+    expect(parseMountRows(['  /host  :  /container  '])).toEqual([
+      { host: '/host', container: '/container' },
+    ]);
+  });
+
+  it('parseMountRows yields a host-only row for an entry with no colon', () => {
+    expect(parseMountRows(['/host-only'])).toEqual([{ host: '/host-only', container: '' }]);
+  });
+
+  it('parseMountRows treats only the first colon as the separator', () => {
+    expect(parseMountRows(['/a:/b:/c'])).toEqual([{ host: '/a', container: '/b:/c' }]);
+  });
+
+  it('parseMountRows returns [] for undefined/empty input', () => {
+    expect(parseMountRows(undefined)).toEqual([]);
+    expect(parseMountRows([])).toEqual([]);
+  });
+
+  it('mountRowError accepts a valid pair and a fully-empty row', () => {
+    expect(mountRowError({ host: '/a', container: '/b' })).toBeNull();
+    expect(mountRowError({ host: '  ', container: '' })).toBeNull();
+  });
+
+  it('mountRowError flags a missing host or container', () => {
+    expect(mountRowError({ host: '', container: '/b' })).toBe('Host path is required');
+    expect(mountRowError({ host: '/a', container: '' })).toBe('Container path is required');
+  });
+
+  it('mountRowError rejects a colon inside either half', () => {
+    expect(mountRowError({ host: '/a:/x', container: '/b' })).toBe('Paths must not contain ":"');
+    expect(mountRowError({ host: '/a', container: '/b:ro' })).toBe('Paths must not contain ":"');
+  });
+
+  it('hasMountRowErrors is true when any row is malformed', () => {
+    expect(hasMountRowErrors([{ host: '/a', container: '/b' }, { host: '', container: '' }])).toBe(false);
+    expect(hasMountRowErrors([{ host: '/a', container: '' }])).toBe(true);
+  });
+
+  it('serializeMountRows trims, skips empty rows, and joins with a colon', () => {
+    const rows: MountRow[] = [
+      { host: '  /host  ', container: '  /container  ' },
+      { host: '', container: '' },
+      { host: '~/.gmail-mcp', container: '/home/node/.gmail-mcp' },
+    ];
+    expect(serializeMountRows(rows)).toEqual([
+      '/host:/container',
+      '~/.gmail-mcp:/home/node/.gmail-mcp',
+    ]);
+  });
+
+  it('serializeMountRows round-trips through parseMountRows', () => {
+    const serialized = ['~/.gmail-mcp:/home/node/.gmail-mcp', '/data:/srv/data'];
+    expect(serializeMountRows(parseMountRows(serialized))).toEqual(serialized);
+  });
+});
+
+// buildMountExample — the host side must be a valid absolute docker arg
+// (docker rejects `~/...`); the container side is always the generic
+// `/home/node/example`, and a failed home-dir lookup falls back to an
+// absolute placeholder path.
+describe('buildMountExample', () => {
+  it('uses the resolved home directory on the host side', () => {
+    expect(buildMountExample('/Users/alex')).toBe('/Users/alex/example:/home/node/example');
+  });
+
+  it('strips a trailing slash from the home directory', () => {
+    expect(buildMountExample('/home/alex/')).toBe('/home/alex/example:/home/node/example');
+  });
+
+  it('falls back to an absolute placeholder when home is null/blank', () => {
+    expect(buildMountExample(null)).toBe(`${MOUNT_EXAMPLE_FALLBACK_HOST}:/home/node/example`);
+    expect(buildMountExample(undefined)).toBe(`${MOUNT_EXAMPLE_FALLBACK_HOST}:/home/node/example`);
+    expect(buildMountExample('   ')).toBe(`${MOUNT_EXAMPLE_FALLBACK_HOST}:/home/node/example`);
+  });
+
+  it('never produces a `~`-prefixed or product-specific example', () => {
+    const example = buildMountExample('/Users/alex');
+    expect(example).not.toContain('~');
+    expect(example.toLowerCase()).not.toContain('gmail');
+    expect(MOUNT_EXAMPLE_FALLBACK_HOST.startsWith('/')).toBe(true);
+  });
+});
+
+// Isolation defaults — stdio endpoints always send an explicit value
+// ("container"/"none", never omitted) because the relay treats an absent
+// field as direct spawn. Flagged catalog entries force "none".
+describe('resolveIsolation', () => {
+  it('returns "container" for stdio when containerizable and toggle is on (default)', () => {
+    expect(resolveIsolation('stdio', true, true)).toBe('container');
+  });
+
+  it('returns "none" for stdio when the user turns the toggle off', () => {
+    expect(resolveIsolation('stdio', true, false)).toBe('none');
+  });
+
+  it('returns "none" for flagged catalog entries regardless of the toggle', () => {
+    expect(resolveIsolation('stdio', false, true)).toBe('none');
+    expect(resolveIsolation('stdio', false, false)).toBe('none');
+  });
+
+  it('returns undefined for non-stdio transports', () => {
+    for (const t of ['sse', 'http', 'oauth'] as const) {
+      expect(resolveIsolation(t, true, true)).toBeUndefined();
+      expect(resolveIsolation(t, false, false)).toBeUndefined();
+    }
+  });
+});
+
+// Config-tab seeding — maps the stored isolation value to the toggle state.
+// Only an explicit "container" reads ON; "none"/empty/absent all mean direct
+// spawn (the relay's default for an omitted field).
+describe('isolationEnabledFromConfig', () => {
+  it('returns true only for an explicit "container"', () => {
+    expect(isolationEnabledFromConfig('container')).toBe(true);
+  });
+
+  it('returns false for "none"', () => {
+    expect(isolationEnabledFromConfig('none')).toBe(false);
+  });
+
+  it('returns false for empty/absent values (direct-spawn default)', () => {
+    expect(isolationEnabledFromConfig('')).toBe(false);
+    expect(isolationEnabledFromConfig(undefined)).toBe(false);
+  });
+
+  it('returns false for unrecognized values', () => {
+    expect(isolationEnabledFromConfig('CONTAINER')).toBe(false);
+    expect(isolationEnabledFromConfig('docker')).toBe(false);
+  });
+});
+
+describe('catalog containerizable flags', () => {
+  it('exactly Filesystem, Puppeteer, and Memory are flagged not-containerizable', () => {
+    const flagged = CATALOG_SERVERS.filter((s) => s.containerizable === false)
+      .map((s) => s.id)
+      .sort();
+    expect(flagged).toEqual(['filesystem', 'memory', 'puppeteer']);
+  });
+
+  it('every flagged entry carries a non-empty containerNote reason', () => {
+    for (const s of CATALOG_SERVERS) {
+      if (s.containerizable === false) {
+        expect(s.containerNote, `${s.id}: missing containerNote`).toBeTruthy();
+        expect(s.containerNote!.trim().length).toBeGreaterThan(0);
+      }
+    }
+  });
+});
+
+describe('buildCatalogEnvAndHeaders', () => {
+  const plainVar = { name: 'API_KEY', label: 'API Key', required: true, secret: true };
+  const headerVar = {
+    name: 'PAT',
+    label: 'Personal Access Token',
+    required: true,
+    secret: true,
+    header: { name: 'Authorization', valuePrefix: 'Bearer ' },
+  };
+
+  it('routes a header-typed var to headers with its prefix', () => {
+    const out = buildCatalogEnvAndHeaders({ envVars: [headerVar] }, { PAT: 'ghp_abc' });
+    expect(out.headers).toEqual({ Authorization: 'Bearer ghp_abc' });
+    expect(out.env).toEqual({});
+  });
+
+  it('routes a plain var to env', () => {
+    const out = buildCatalogEnvAndHeaders({ envVars: [plainVar] }, { API_KEY: 'k123' });
+    expect(out.env).toEqual({ API_KEY: 'k123' });
+    expect(out.headers).toEqual({});
+  });
+
+  it('trims values and skips empty ones', () => {
+    const out = buildCatalogEnvAndHeaders(
+      { envVars: [plainVar, headerVar] },
+      { API_KEY: '  k123  ', PAT: '   ' },
+    );
+    expect(out.env).toEqual({ API_KEY: 'k123' });
+    expect(out.headers).toEqual({});
+  });
+
+  it('skips vars with no entered value', () => {
+    const out = buildCatalogEnvAndHeaders({ envVars: [plainVar, headerVar] }, {});
+    expect(out).toEqual({ env: {}, headers: {} });
+  });
+
+  it('trims the header name and skips blank header names', () => {
+    const padded = buildCatalogEnvAndHeaders(
+      { envVars: [{ ...headerVar, header: { name: '  X-Api-Key  ' } }] },
+      { PAT: 'raw' },
+    );
+    expect(padded.headers).toEqual({ 'X-Api-Key': 'raw' });
+
+    const blank = buildCatalogEnvAndHeaders(
+      { envVars: [{ ...headerVar, header: { name: '   ' } }] },
+      { PAT: 'raw' },
+    );
+    expect(blank).toEqual({ env: {}, headers: {} });
+  });
+
+  it('uses an empty prefix when valuePrefix is absent', () => {
+    const out = buildCatalogEnvAndHeaders(
+      { envVars: [{ ...headerVar, header: { name: 'X-Api-Key' } }] },
+      { PAT: 'raw' },
+    );
+    expect(out.headers).toEqual({ 'X-Api-Key': 'raw' });
+  });
+
+  it('splits a mixed set into env and headers', () => {
+    const out = buildCatalogEnvAndHeaders(
+      { envVars: [plainVar, headerVar] },
+      { API_KEY: 'k123', PAT: 'ghp_abc' },
+    );
+    expect(out).toEqual({
+      env: { API_KEY: 'k123' },
+      headers: { Authorization: 'Bearer ghp_abc' },
+    });
+  });
+
+  it('maps the catalog GitHub entry PAT to an Authorization bearer header', () => {
+    const github = CATALOG_SERVERS.find((s) => s.id === 'github')!;
+    const out = buildCatalogEnvAndHeaders(github, { [github.envVars[0].name]: 'ghp_xyz' });
+    expect(out).toEqual({ env: {}, headers: { Authorization: 'Bearer ghp_xyz' } });
+  });
+
+  it('produces no GITHUB_PERSONAL_ACCESS_TOKEN env var for the GitHub entry', () => {
+    const github = CATALOG_SERVERS.find((s) => s.id === 'github')!;
+    const out = buildCatalogEnvAndHeaders(github, { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_xyz' });
+    expect(out.env).not.toHaveProperty('GITHUB_PERSONAL_ACCESS_TOKEN');
+    expect(out.headers.Authorization).toBe('Bearer ghp_xyz');
+  });
+});
+
+describe('mergeHeaders', () => {
+  const seeded = { Authorization: 'Bearer ghp_abc' };
+
+  it('returns the seeded headers unchanged when there are no custom rows', () => {
+    expect(mergeHeaders(seeded, [])).toEqual(seeded);
+  });
+
+  it('adds custom rows that do not collide with seeded keys', () => {
+    expect(mergeHeaders(seeded, [{ key: 'X-Trace', value: '1' }])).toEqual({
+      Authorization: 'Bearer ghp_abc',
+      'X-Trace': '1',
+    });
+  });
+
+  it('lets a custom row override a seeded key with the same case', () => {
+    expect(mergeHeaders(seeded, [{ key: 'Authorization', value: 'token x' }])).toEqual({
+      Authorization: 'token x',
+    });
+  });
+
+  it('lets a custom row override a seeded key case-insensitively without leaving two keys', () => {
+    const out = mergeHeaders(seeded, [{ key: 'authorization', value: 'token x' }]);
+    expect(out).toEqual({ authorization: 'token x' });
+    expect(Object.keys(out)).toHaveLength(1);
+  });
+
+  it('trims custom keys and skips blank ones', () => {
+    expect(
+      mergeHeaders(seeded, [
+        { key: '  X-Trace  ', value: '1' },
+        { key: '   ', value: 'ignored' },
+      ]),
+    ).toEqual({ Authorization: 'Bearer ghp_abc', 'X-Trace': '1' });
+  });
+
+  it('applies later custom rows over earlier ones, case-insensitively', () => {
+    expect(
+      mergeHeaders({}, [
+        { key: 'X-Api-Key', value: 'a' },
+        { key: 'x-api-key', value: 'b' },
+      ]),
+    ).toEqual({ 'x-api-key': 'b' });
+  });
+
+  it('does not mutate the seeded map', () => {
+    const base = { Authorization: 'Bearer ghp_abc' };
+    mergeHeaders(base, [{ key: 'authorization', value: 'x' }]);
+    expect(base).toEqual({ Authorization: 'Bearer ghp_abc' });
+  });
+
+  it('stores prototype-named keys as plain entries without polluting the prototype', () => {
+    const out = mergeHeaders(seeded, [
+      { key: '__proto__', value: 'x' },
+      { key: 'constructor', value: 'y' },
+    ]);
+    expect(Object.getPrototypeOf(out)).toBeNull();
+    expect(Object.keys(out).sort()).toEqual(['Authorization', '__proto__', 'constructor']);
+    expect(out['__proto__']).toBe('x');
+    expect(out['constructor']).toBe('y');
+    expect(({} as Record<string, unknown>)['x']).toBeUndefined();
+    expect(Object.keys(JSON.parse(JSON.stringify(out))).sort()).toEqual([
+      'Authorization',
+      '__proto__',
+      'constructor',
+    ]);
+  });
+});
+
+// The modal builds its env/headers from `buildCatalogEnvAndHeaders` in both
+// the Test Connection (`buildConnectionParams`) and Add (`handleSubmit`)
+// paths, so header-typed catalog vars (GitHub PAT) reach `params.headers`.
+// Test environment is node (not jsdom), so the assertions are on the Svelte
+// source — mirrors the static-source style used elsewhere in this suite.
+describe('AddEndpointModal — catalog env/header wiring', () => {
+  it('prefills the URL from the catalog entry in selectCatalog', () => {
+    const selectCatalogBlock = addEndpointModalSource.match(
+      /function selectCatalog\(server: CatalogServer\) \{[\s\S]*?step = 'configure';/,
+    );
+    expect(selectCatalogBlock, 'expected the selectCatalog body').not.toBeNull();
+    expect(selectCatalogBlock![0]).toMatch(/url = server\.url \?\? '';/);
+    expect(selectCatalogBlock![0]).toMatch(/command = server\.command \?\? '';/);
+    expect(selectCatalogBlock![0]).toMatch(/args = \(server\.args \?\? \[\]\)\.join\(' '\);/);
+  });
+
+  it('routes catalog values through buildCatalogEnvAndHeaders in both Test Connection and Add', () => {
+    const calls = addEndpointModalSource.match(
+      /buildCatalogEnvAndHeaders\(selectedCatalog, catalogEnvValues\)/g,
+    ) ?? [];
+    expect(calls.length).toBe(2);
+    // No inline catalog env loop remains — the helper is the single source of truth.
+    expect(addEndpointModalSource).not.toMatch(/for \(const ev of selectedCatalog\.envVars\)/);
+  });
+
+  it('seeds env and headers from the helper output, with custom rows applied afterwards', () => {
+    // Catalog-derived values seed the maps; the user's custom env rows are
+    // spread in afterwards, and custom header rows go through `mergeHeaders`
+    // so a custom row wins on a (case-insensitive) key collision.
+    const envSeeds = addEndpointModalSource.match(
+      /const env: Record<string, string> = \{ \.\.\.catalogValues\.env \};/g,
+    ) ?? [];
+    const headerMerges = addEndpointModalSource.match(
+      /const headers = mergeHeaders\(catalogValues\.headers, headerVars\);/g,
+    ) ?? [];
+    expect(envSeeds.length).toBe(2);
+    expect(headerMerges.length).toBe(2);
+    // No inline case-sensitive header assignment remains.
+    expect(addEndpointModalSource).not.toMatch(/headers\[h\.key\.trim\(\)\] = h\.value;/);
+  });
+
+  it('skips the add-time OAuth probe when the catalog entry supplies header credentials', () => {
+    // The GitHub remote server advertises OAuth, so without this gate a user
+    // who entered a PAT would be shown the "supports OAuth" escalation prompt
+    // (whose "Keep unauthenticated" option misdescribes the bearer-PAT add).
+    // `catalogValues` must be computed before the probe so the gate can see
+    // the header-typed values.
+    const handleSubmitBlock = addEndpointModalSource.match(
+      /async function handleSubmit\([\s\S]*?const trimmedName = name\.trim\(\);/,
+    );
+    expect(handleSubmitBlock, 'expected the handleSubmit pre-add body').not.toBeNull();
+    expect(handleSubmitBlock![0]).toMatch(
+      /const catalogValues = selectedCatalog\s*\?\s*buildCatalogEnvAndHeaders\(selectedCatalog, catalogEnvValues\)[\s\S]*?const hasCatalogHeaderCredentials = Object\.keys\(catalogValues\.headers\)\.length > 0;[\s\S]*?if \(\s*!opts\?\.skipProbe &&\s*!hasCatalogHeaderCredentials &&\s*\(transport === 'http' \|\| transport === 'sse'\)\s*\) \{[\s\S]*?probe = await oauthProbe\(url\.trim\(\)\);/,
+    );
+  });
+
+  it('keeps the container toggle and volume mounts gated on the stdio transport', () => {
+    // http catalog entries (GitHub) must not show Command/Arguments or the
+    // isolation controls; both live under the stdio branch.
+    expect(addEndpointModalSource).toMatch(
+      /\{#if transport === 'stdio'\}[\s\S]*?id="modal-ep-cmd"[\s\S]*?id="modal-ep-args"[\s\S]*?id="modal-ep-isolation"[\s\S]*?\{:else if transport === 'oauth'\}/,
+    );
+    expect(addEndpointModalSource).toMatch(
+      /let showMounts = \$derived\(transport === 'stdio' && isolationEnabled && !catalogNotContainerizable\);/,
+    );
+  });
+
+  it('still shows the API Key chip for the GitHub catalog entry', () => {
+    const github = CATALOG_SERVERS.find((s) => s.id === 'github')!;
+    expect(github.envVars.some((e) => e.required)).toBe(true);
+    expect(addEndpointModalSource).toMatch(
+      /\{#if server\.envVars\.some\(e => e\.required\)\}[\s\S]*?API Key/,
+    );
+  });
+});
+
+describe('orgBindingApplies', () => {
+  // The relay only accepts EMA on http/oauth (watcher.rs:
+  // "EMA endpoint requires transport http or oauth"), and
+  // `buildOrgBoundEndpointParams` always emits an http EMA endpoint regardless
+  // of the chosen transport — so the Organization selector is safe to surface
+  // for both. sse carries no per-request headers (EMA can't inject Authorization)
+  // and stdio has no remote auth surface at all, so both stay excluded.
+  it('is true for the http and oauth transports', () => {
+    expect(orgBindingApplies('http')).toBe(true);
+    expect(orgBindingApplies('oauth')).toBe(true);
+  });
+
+  it('is false for sse and stdio', () => {
+    for (const t of ['sse', 'stdio'] as const) {
+      expect(orgBindingApplies(t)).toBe(false);
+    }
+  });
+});
+
+describe('buildOrgBoundEndpointParams', () => {
+  it('returns null when no organization is selected (None)', () => {
+    expect(
+      buildOrgBoundEndpointParams('', { name: 'My Server', url: 'https://mcp.example.com/mcp' }),
+    ).toBeNull();
+  });
+
+  it('returns null for a whitespace-only organization', () => {
+    expect(
+      buildOrgBoundEndpointParams('   ', { name: 'My Server', url: 'https://mcp.example.com/mcp' }),
+    ).toBeNull();
+  });
+
+  it('builds an http endpoint with an auth.type="ema" block bound to the org', () => {
+    const params = buildOrgBoundEndpointParams('Acme', {
+      name: 'My Server',
+      url: 'https://mcp.example.com/mcp',
+    });
+    expect(params).toEqual({
+      name: 'My Server',
+      transport: 'http',
+      url: 'https://mcp.example.com/mcp',
+      auth: { type: 'ema', organization: 'Acme', resource: 'https://mcp.example.com/mcp' },
+    });
+  });
+
+  it('uses the URL as the EMA resource and trims surrounding whitespace', () => {
+    const params = buildOrgBoundEndpointParams('  Acme  ', {
+      name: '  My Server  ',
+      url: '  https://mcp.example.com/mcp  ',
+    });
+    expect(params?.auth).toEqual({
+      type: 'ema',
+      organization: 'Acme',
+      resource: 'https://mcp.example.com/mcp',
+    });
+    expect(params?.name).toBe('My Server');
+    expect(params?.url).toBe('https://mcp.example.com/mcp');
+  });
+
+  it('includes a trimmed description when provided and omits a blank one', () => {
+    const withDesc = buildOrgBoundEndpointParams('Acme', {
+      name: 'My Server',
+      url: 'https://mcp.example.com/mcp',
+      description: '  notes  ',
+    });
+    expect(withDesc?.description).toBe('notes');
+
+    const blankDesc = buildOrgBoundEndpointParams('Acme', {
+      name: 'My Server',
+      url: 'https://mcp.example.com/mcp',
+      description: '   ',
+    });
+    expect(blankDesc && 'description' in blankDesc).toBe(false);
+  });
+
+  // D3 — optional EMA scopes + resource pair (R3), settable at add-time.
+  // `scopes` stays on the POST `/endpoints` body (config.toml); the resource
+  // pair is stripped by `addEndpoint()` and POSTed to `/credentials` (DCR
+  // file). Blank/whitespace input omits each field entirely.
+  it('omits scopes / resource_client_id / resource_client_secret when no extras are supplied', () => {
+    const params = buildOrgBoundEndpointParams('Acme', {
+      name: 'My Server',
+      url: 'https://mcp.example.com/mcp',
+    });
+    expect(params && 'scopes' in params).toBe(false);
+    expect(params && 'resource_client_id' in params).toBe(false);
+    expect(params && 'resource_client_secret' in params).toBe(false);
+  });
+
+  it('includes scopes / resource_client_id / resource_client_secret when non-empty (trimmed)', () => {
+    const params = buildOrgBoundEndpointParams('Acme', {
+      name: 'My Server',
+      url: 'https://mcp.example.com/mcp',
+      scopes: '  todos.read   mcp.access  ',
+      resourceClientId: '  mas-client-abc  ',
+      resourceClientSecret: '  super-secret  ',
+    });
+    expect(params?.scopes).toBe('todos.read mcp.access');
+    expect(params?.resource_client_id).toBe('mas-client-abc');
+    expect(params?.resource_client_secret).toBe('super-secret');
+  });
+
+  it('omits each extra field independently when blank or whitespace-only', () => {
+    const params = buildOrgBoundEndpointParams('Acme', {
+      name: 'My Server',
+      url: 'https://mcp.example.com/mcp',
+      scopes: '   ',
+      resourceClientId: '',
+      resourceClientSecret: '\t\n  ',
+    });
+    expect(params && 'scopes' in params).toBe(false);
+    expect(params && 'resource_client_id' in params).toBe(false);
+    expect(params && 'resource_client_secret' in params).toBe(false);
+  });
+
+  it('still returns null when no organization is selected, even with extras supplied', () => {
+    expect(
+      buildOrgBoundEndpointParams('', {
+        name: 'My Server',
+        url: 'https://mcp.example.com/mcp',
+        scopes: 'todos.read',
+        resourceClientId: 'mas-client-abc',
+        resourceClientSecret: 'super-secret',
+      }),
+    ).toBeNull();
+  });
+
+  it('treats a partial extras set independently (scopes only, resource pair only)', () => {
+    const scopesOnly = buildOrgBoundEndpointParams('Acme', {
+      name: 'My Server',
+      url: 'https://mcp.example.com/mcp',
+      scopes: 'todos.read',
+    });
+    expect(scopesOnly?.scopes).toBe('todos.read');
+    expect(scopesOnly && 'resource_client_id' in scopesOnly).toBe(false);
+    expect(scopesOnly && 'resource_client_secret' in scopesOnly).toBe(false);
+
+    const resourceOnly = buildOrgBoundEndpointParams('Acme', {
+      name: 'My Server',
+      url: 'https://mcp.example.com/mcp',
+      resourceClientId: 'mas-client-abc',
+      resourceClientSecret: 'super-secret',
+    });
+    expect(resourceOnly && 'scopes' in resourceOnly).toBe(false);
+    expect(resourceOnly?.resource_client_id).toBe('mas-client-abc');
+    expect(resourceOnly?.resource_client_secret).toBe('super-secret');
+  });
+});
+
+// ── Test Connection suppression when org-bound ──
+//
+// When an org is selected, the EMA add-time path can't be exercised by a raw
+// transport+url probe — the access token only exists once the org's IdP chain
+// runs at add-time. Showing "Test Connection" would just return a misleading
+// 401, so it's hidden and replaced with a short post-add verification note.
+// Test environment is node (not jsdom), so the assertion is on the Svelte
+// source — mirrors the static-source style used elsewhere in this suite.
+describe('AddEndpointModal — Test Connection gating when org-bound', () => {
+  it('gates the Test Connection block on `transport !== "oauth" && !orgBound`', () => {
+    // The button only shows for non-oauth transports AND when no org is bound.
+    // The combined guard is what restores today's behavior when org is "None"
+    // (orgBound=false → the `!orgBound` branch passes → button visible).
+    expect(addEndpointModalSource).toMatch(/\{#if transport !== 'oauth' && !orgBound\}/);
+  });
+
+  it('replaces Test Connection with a post-add verification note when org-bound', () => {
+    // The `:else if orgBound` branch handles the http+orgBound case (oauth is
+    // already excluded by the outer guard) and explains the test is unavailable
+    // because verification happens via the org's shared credentials at add-time.
+    const replacementBlock = addEndpointModalSource.match(
+      /\{:else if orgBound\}[\s\S]*?Connection is verified via[\s\S]*?\{selectedOrganization\}[\s\S]*?after you add the server[\s\S]*?\{\/if\}/,
+    );
+    expect(replacementBlock, 'expected the org-bound replacement note for Test Connection').not.toBeNull();
+  });
+
+  it('renders the EMA outcome notice under an `{#if orgBound}` guard naming the selected org', () => {
+    // Shared notice rendered right after the org selector for both http and
+    // oauth selections, so the user sees the EMA endpoint outcome explicitly
+    // before submitting.
+    const noticeBlock = addEndpointModalSource.match(
+      /\{#if orgBound\}[\s\S]*?organization-managed \(EMA\) endpoint[\s\S]*?\{selectedOrganization\}[\s\S]*?shared credentials instead of its own OAuth[\s\S]*?\{\/if\}/,
+    );
+    expect(noticeBlock, 'expected the EMA outcome notice block').not.toBeNull();
+  });
+
+  // D3/D4 — The optional EMA Scopes + Resource Client ID/Secret inputs live
+  // inside the single consolidated Advanced <details>, gated on
+  // `{#if orgBound}` so they only appear once an org is actually selected.
+  // Each input is bound to its own local `$state` and threaded into
+  // `buildOrgBoundEndpointParams` on submit.
+  it('renders Scopes + Resource Client ID/Secret inputs guarded by `{#if orgBound}` inside the Advanced section', () => {
+    expect(addEndpointModalSource).toMatch(/id="modal-ep-orgbound-scopes"[\s\S]*?bind:value=\{orgBoundScopes\}/);
+    expect(addEndpointModalSource).toMatch(
+      /id="modal-ep-orgbound-resource-client-id"[\s\S]*?bind:value=\{resourceClientId\}/,
+    );
+    expect(addEndpointModalSource).toMatch(
+      /id="modal-ep-orgbound-resource-client-secret"[\s\S]*?type="password"[\s\S]*?bind:value=\{resourceClientSecret\}/,
+    );
+    // The EMA field group is nested inside the shared Advanced <details>
+    // gated on `{#if orgBound || transport !== 'oauth'}`.
+    expect(addEndpointModalSource).toMatch(
+      /\{#if orgBound \|\| transport !== 'oauth'\}[\s\S]*?<summary[^>]*>\s*Advanced\s*<\/summary>[\s\S]*?\{#if orgBound\}[\s\S]*?id="modal-ep-orgbound-scopes"/,
+    );
+  });
+
+  // D4 — After the org-bound EMA fields were folded into the pre-existing
+  // Server-type-override Advanced <details>, the http/stdio branch of the
+  // modal must have exactly ONE Advanced section, and the D3 duplicate
+  // Advanced <details> that used to live directly inside `{#if orgBound}`
+  // (sandwiching the URL/Env/Headers fields with a second Advanced summary)
+  // must no longer exist. The remaining Advanced <summary> occurrences in
+  // source are: (1) the per-server OAuth branch's Advanced (gated on
+  // `transport === 'oauth'` + `{#if !orgBound}` — never renders in the
+  // org-bound flow), and (2) the single consolidated Advanced gated on
+  // `{#if orgBound || transport !== 'oauth'}` that this task establishes.
+  it('no longer renders a duplicate Advanced <details> directly inside `{#if orgBound}` (D3 sandwich fix)', () => {
+    // The D3 layout put a full `<details>...Advanced...</details>` block
+    // directly under the `{#if orgBound}` guard, above the URL field. D4
+    // moves those fields into the consolidated Advanced further down, so
+    // no Advanced <summary> should appear between `{#if orgBound}` and the
+    // closing `{/if}` that ends the org-bound guarded block.
+    const orgBoundInnerBlock = addEndpointModalSource.match(
+      /\{#if orgBound\}\s*<!--\s*EMA outcome notice[\s\S]*?\{\/if\}/,
+    );
+    expect(orgBoundInnerBlock, 'expected the org-bound EMA notice block').not.toBeNull();
+    expect(orgBoundInnerBlock![0]).not.toMatch(/<summary[^>]*>\s*Advanced\s*<\/summary>/);
+  });
+
+  // D4 — Total Advanced <summary> occurrences in source are exactly 2:
+  // the per-server OAuth branch's Advanced (mutually exclusive with the
+  // org-bound branch via `{#if !orgBound}`) and the single consolidated
+  // Advanced. No third one may exist.
+  it('renders exactly two Advanced <summary> occurrences in source (per-server OAuth + consolidated)', () => {
+    const matches = addEndpointModalSource.match(/<summary[^>]*>\s*Advanced\s*<\/summary>/g) ?? [];
+    expect(matches.length).toBe(2);
+  });
+
+  it('keeps per-server OAuth fields under a `{#if !orgBound}` guard on the oauth transport', () => {
+    // The per-server OAuth fields (scopes, client ID/secret, etc.) are
+    // unused on the EMA path, so they're hidden when an org is bound. The
+    // outer oauth-transport branch wraps them in `{#if !orgBound}`.
+    expect(addEndpointModalSource).toMatch(/\{#if !orgBound\}[\s\S]*?Per-server OAuth fields are dropped/);
+  });
+
+  it('routes the submit button to handleSubmit (EMA path) when org-bound, bypassing handleOAuthSubmit', () => {
+    // Even on the oauth transport, an org-bound submit must go through
+    // `handleSubmit` → `buildOrgBoundEndpointParams` → plain EMA add.
+    expect(addEndpointModalSource).toMatch(
+      /onclick=\{transport === 'oauth' && !orgBound \? handleOAuthSubmit : \(\) => handleSubmit\(\)\}/,
+    );
   });
 });
 

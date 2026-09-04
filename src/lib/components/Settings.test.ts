@@ -12,6 +12,8 @@ vi.mock('$lib/api', () => ({
   getConfig: getConfigMock,
   reloadConfig: reloadConfigMock,
   getStatus: vi.fn(),
+  getObservabilityConfig: vi.fn(),
+  putObservabilityConfig: vi.fn(),
 }));
 
 describe('Settings relay retry behavior', () => {
@@ -279,6 +281,131 @@ describe('Settings TOON output helpers', () => {
   });
 });
 
+describe('Settings write directories helpers', () => {
+  const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    invokeMock.mockReset();
+    getConfigMock.mockReset();
+    reloadConfigMock.mockReset();
+    // Reset the shared store to its default (empty) before each test so
+    // order doesn't matter.
+    const { writeDirs } = await import('$lib/stores');
+    writeDirs.set([]);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('fetchWriteDirs updates the store from the Tauri command', async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'get_write_dirs') return Promise.resolve(['/tmp/a', '/tmp/b']);
+      return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+    });
+    const { fetchWriteDirs } = await import('$lib/writeDirsUi');
+    const { writeDirs } = await import('$lib/stores');
+
+    await fetchWriteDirs();
+
+    expect(invokeMock).toHaveBeenCalledWith('get_write_dirs');
+    expect(get(writeDirs)).toEqual(['/tmp/a', '/tmp/b']);
+  });
+
+  it('fetchWriteDirs is resilient to a failing Tauri command', async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+    });
+    const { fetchWriteDirs } = await import('$lib/writeDirsUi');
+    const { writeDirs } = await import('$lib/stores');
+    writeDirs.set(['/tmp/kept']);
+
+    await expect(fetchWriteDirs()).resolves.toBeUndefined();
+    expect(get(writeDirs)).toEqual(['/tmp/kept']);
+  });
+
+  it('addWriteDir calls set_write_dirs then reloadConfig, in order', async () => {
+    const callOrder: string[] = [];
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === 'set_write_dirs') {
+        callOrder.push(`set:${JSON.stringify(args?.dirs)}`);
+        return Promise.resolve(undefined);
+      }
+      return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+    });
+    reloadConfigMock.mockImplementation(() => {
+      callOrder.push('reload');
+      return Promise.resolve();
+    });
+    const { addWriteDir } = await import('$lib/writeDirsUi');
+    const { writeDirs } = await import('$lib/stores');
+    writeDirs.set(['/tmp/a']);
+
+    await addWriteDir('/tmp/b');
+
+    expect(invokeMock).toHaveBeenCalledWith('set_write_dirs', { dirs: ['/tmp/a', '/tmp/b'] });
+    expect(reloadConfigMock).toHaveBeenCalledTimes(1);
+    expect(callOrder).toEqual(['set:["/tmp/a","/tmp/b"]', 'reload']);
+    expect(get(writeDirs)).toEqual(['/tmp/a', '/tmp/b']);
+  });
+
+  it('addWriteDir is a no-op for a duplicate directory', async () => {
+    const { addWriteDir } = await import('$lib/writeDirsUi');
+    const { writeDirs } = await import('$lib/stores');
+    writeDirs.set(['/tmp/a']);
+
+    await addWriteDir('/tmp/a');
+
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(reloadConfigMock).not.toHaveBeenCalled();
+    expect(get(writeDirs)).toEqual(['/tmp/a']);
+  });
+
+  it('removeWriteDir calls set_write_dirs then reloadConfig with the entry removed', async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'set_write_dirs') return Promise.resolve(undefined);
+      return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+    });
+    reloadConfigMock.mockResolvedValue(undefined);
+    const { removeWriteDir } = await import('$lib/writeDirsUi');
+    const { writeDirs } = await import('$lib/stores');
+    writeDirs.set(['/tmp/a', '/tmp/b']);
+
+    await removeWriteDir('/tmp/a');
+
+    expect(invokeMock).toHaveBeenCalledWith('set_write_dirs', { dirs: ['/tmp/b'] });
+    expect(reloadConfigMock).toHaveBeenCalledTimes(1);
+    expect(get(writeDirs)).toEqual(['/tmp/b']);
+  });
+
+  it('removeWriteDir is a no-op for an unknown directory', async () => {
+    const { removeWriteDir } = await import('$lib/writeDirsUi');
+    const { writeDirs } = await import('$lib/stores');
+    writeDirs.set(['/tmp/a']);
+
+    await removeWriteDir('/tmp/zzz');
+
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(reloadConfigMock).not.toHaveBeenCalled();
+    expect(get(writeDirs)).toEqual(['/tmp/a']);
+  });
+
+  it('addWriteDir reverts the store when set_write_dirs rejects', async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'set_write_dirs') return Promise.reject(new Error('write failed'));
+      return Promise.reject(new Error(`unexpected invoke: ${cmd}`));
+    });
+    const { addWriteDir } = await import('$lib/writeDirsUi');
+    const { writeDirs } = await import('$lib/stores');
+    writeDirs.set(['/tmp/a']);
+
+    await addWriteDir('/tmp/b');
+
+    expect(get(writeDirs)).toEqual(['/tmp/a']);
+    expect(reloadConfigMock).not.toHaveBeenCalled();
+  });
+});
+
 
 // Phase 5 — "Activity overlay" section in Settings.svelte. The handlers are
 // inline arrow functions, so following the codebase convention used in
@@ -336,6 +463,47 @@ describe('Settings activity overlay wiring', () => {
     expect(source).toMatch(
       /onclick=\{\(\)\s*=>\s*updateOverlaySettings\(\s*\{\s*show_profile:\s*!\$overlaySettings\.show_profile\s*\}\s*\)\}/,
     );
+  });
+});
+
+// Observability section wiring — the controls use inline handlers, so we follow
+// the same `?raw` source-level assertion convention used for the activity
+// overlay block above to confirm the Settings UI is wired to D1's API and the
+// shared observability-settings helpers.
+describe('Settings observability section wiring', () => {
+  it('imports the observability API + helpers', async () => {
+    const source = (await import('./Settings.svelte?raw')).default;
+    expect(source).toMatch(
+      /import\s*\{[\s\S]*?getObservabilityConfig[\s\S]*?putObservabilityConfig[\s\S]*?\}\s*from\s*['"]\$lib\/api['"]/,
+    );
+    expect(source).toMatch(/from\s*['"]\$lib\/components\/observability-settings-helpers['"]/);
+  });
+
+  it('loads the config on mount and saves via putObservabilityConfig', async () => {
+    const source = (await import('./Settings.svelte?raw')).default;
+    expect(source).toContain('loadObservabilityConfig()');
+    expect(source).toMatch(/await getObservabilityConfig\(\)/);
+    expect(source).toMatch(/await putObservabilityConfig\(/);
+  });
+
+  it('renders an unavailable notice when the store could not be opened', async () => {
+    const source = (await import('./Settings.svelte?raw')).default;
+    expect(source).toContain('obsUnavailable');
+    expect(source).toContain('Observability is unavailable.');
+  });
+
+  it('wires the enable + store_payloads toggles and disables payload capture when off', async () => {
+    const source = (await import('./Settings.svelte?raw')).default;
+    expect(source).toMatch(/onclick=\{\(\)\s*=>\s*obsConfig\.enabled\s*=\s*!obsConfig\.enabled\}/);
+    expect(source).toMatch(/onclick=\{\(\)\s*=>\s*obsConfig\.store_payloads\s*=\s*!obsConfig\.store_payloads\}/);
+    expect(source).toMatch(/disabled=\{!obsConfig\.enabled\}/);
+  });
+
+  it('iterates the numeric fields and disables the save button on errors / when clean', async () => {
+    const source = (await import('./Settings.svelte?raw')).default;
+    expect(source).toContain('OBSERVABILITY_NUMERIC_FIELDS as field');
+    expect(source).toMatch(/coerceObservabilityNumber\(field,/);
+    expect(source).toMatch(/disabled=\{obsSaving \|\| obsHasErrors \|\| !obsDirty\}/);
   });
 });
 

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { theme, jsExecutionMode, toonOutput, relayPort, relayConnected, relaySidecarStatus, relaySidecarError, updateStatus, updateVersion, updateError, updateChannel, lastCheckedChannel } from '$lib/stores';
+  import { theme, jsExecutionMode, toonOutput, writeDirs, relayPort, relayConnected, relaySidecarStatus, relaySidecarError, updateStatus, updateVersion, updateError, updateChannel, lastCheckedChannel } from '$lib/stores';
   import { autoStartEnabled, fetchAutoStart, toggleAutoStart } from '$lib/stores/autostart';
   import {
     AUTO_DISMISS_MS_MAX,
@@ -13,15 +13,31 @@
     type OverlayPosition,
   } from '$lib/overlay/overlaySettingsStore';
   import type { UnlistenFn } from '@tauri-apps/api/event';
-  import type { Theme, RelayStatus } from '$lib/types';
+  import type { Theme, RelayStatus, ObservabilityConfig } from '$lib/types';
   import { invoke } from '@tauri-apps/api/core';
-  import { getStatus } from '$lib/api';
+  import { getStatus, getObservabilityConfig, putObservabilityConfig, getNetworkInterfaces, type NetworkInterfaceInfo } from '$lib/api';
+  import {
+    DEFAULT_OBSERVABILITY_CONFIG,
+    OBSERVABILITY_NUMERIC_FIELDS,
+    coerceObservabilityNumber,
+    isFieldEnabled,
+    isObservabilityConfigDirty,
+    validateObservabilityConfig,
+  } from '$lib/components/observability-settings-helpers';
   import { canRetryRelay, getSettingsStatusLabel, restartRelay } from '$lib/relaySidecarUi';
+  import {
+    buildNetworkExposureRows,
+    toggleListenIp,
+    type NetworkExposureRow,
+  } from '$lib/components/network-exposure-helpers';
   import { fetchJsExecutionMode, toggleJsExecutionMode } from '$lib/jsExecutionModeUi';
   import { fetchToonOutput, toggleToonOutput } from '$lib/toonOutputUi';
+  import { fetchWriteDirs, addWriteDir, removeWriteDir } from '$lib/writeDirsUi';
+  import { open as dialogOpen } from '@tauri-apps/plugin-dialog';
   import { checkAndAutoDownload, restartApp, getUpdateChannel, setUpdateChannel } from '$lib/updater';
   import { onMount, onDestroy } from 'svelte';
   import { toast } from 'svelte-sonner';
+  import OrganizationsSection from './OrganizationsSection.svelte';
 
   let portInput: number = $state($relayPort);
   let portSaved = $state(false);
@@ -151,12 +167,15 @@
     fetchRelayStatus();
     fetchJsExecutionMode();
     fetchToonOutput();
+    fetchWriteDirs();
     fetchAutoStart();
     fetchOverlaySettings();
     subscribeOverlaySettingsChanges()
       .then((un) => { overlaySettingsUnlisten = un; })
       .catch((e) => console.error('[overlay] subscribe failed:', e));
     fetchUpdateChannel();
+    loadObservabilityConfig();
+    loadNetworkExposure();
     invoke('get_config_path_display').then((p: unknown) => {
       if (typeof p === 'string') configFilePath = p;
     }).catch(() => {});
@@ -206,6 +225,158 @@
       relaySidecarError.set(error instanceof Error ? error.message : String(error));
     } finally {
       retryingRelay = false;
+    }
+  }
+
+  // Observability — global config edited in place against a loaded baseline.
+  // The relay returns 503 (→ a thrown error) when its store failed to open, so
+  // a load failure flips `obsUnavailable` and renders a graceful notice instead
+  // of the controls.
+  let obsConfig = $state<ObservabilityConfig>({ ...DEFAULT_OBSERVABILITY_CONFIG });
+  let obsBaseline = $state<ObservabilityConfig>({ ...DEFAULT_OBSERVABILITY_CONFIG });
+  let obsLoading = $state(true);
+  let obsUnavailable = $state(false);
+  let obsSaving = $state(false);
+  let obsSaved = $state(false);
+  let obsSaveError = $state<string | null>(null);
+
+  const obsErrors = $derived(validateObservabilityConfig(obsConfig));
+  const obsHasErrors = $derived(Object.keys(obsErrors).length > 0);
+  const obsDirty = $derived(isObservabilityConfigDirty(obsConfig, obsBaseline));
+
+  async function loadObservabilityConfig() {
+    obsLoading = true;
+    obsUnavailable = false;
+    try {
+      const loaded = await getObservabilityConfig();
+      obsConfig = { ...loaded };
+      obsBaseline = { ...loaded };
+    } catch (e) {
+      obsUnavailable = true;
+      console.error('Failed to load observability config:', e);
+    } finally {
+      obsLoading = false;
+    }
+  }
+
+  // Network exposure — detected interfaces merged with `[relay] listen_ips`.
+  // The relay only reports eligible (private/CGNAT/ULA) addresses and the
+  // merge helper filters configured entries the same way, so no loopback,
+  // unspecified, or public address can ever be rendered here.
+  let netRows = $state<NetworkExposureRow[]>([]);
+  let netListenIps = $state<string[]>([]);
+  let netInterfaces = $state<NetworkInterfaceInfo[]>([]);
+  let netLoading = $state(true);
+  let netUnavailable = $state(false);
+  let netBusyIp = $state<string | null>(null);
+  let netError = $state<string | null>(null);
+
+  // Fetch the interface list, retrying beyond fetchJson's built-in ~2s
+  // window when asked — after a relay restart the management socket may take
+  // several seconds to accept connections again.
+  async function fetchNetworkInterfacesRetrying(extraAttempts: number) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await getNetworkInterfaces();
+      } catch (e) {
+        if (attempt >= extraAttempts) throw e;
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    }
+  }
+
+  async function loadNetworkExposure(extraAttempts = 0) {
+    // Only blank the list with the loading placeholder on the first load;
+    // refetches keep the last-known rows visible until fresh data arrives.
+    if (netRows.length === 0) netLoading = true;
+    try {
+      const res = await fetchNetworkInterfacesRetrying(extraAttempts);
+      netInterfaces = res.interfaces;
+      netListenIps = res.listen_ips;
+      netRows = buildNetworkExposureRows(res.interfaces, res.listen_ips);
+      netUnavailable = false;
+    } catch (e) {
+      netUnavailable = true;
+      console.error('Failed to load network interfaces:', e);
+      // Fallback: read the configured list straight from config.toml so the
+      // user can still disable entries while the relay is unreachable. The
+      // last-known detected interfaces (possibly empty) keep their labels.
+      try {
+        const ips = await invoke<string[]>('get_listen_ips');
+        netListenIps = ips;
+        netRows = buildNetworkExposureRows(netInterfaces, ips);
+      } catch (fallbackErr) {
+        console.error('Failed to read listen_ips from config:', fallbackErr);
+      }
+    } finally {
+      netLoading = false;
+    }
+  }
+
+  // Flip one interface toggle: persist the new full list through the Tauri
+  // backend, then restart the relay (listeners are only bound at startup) so
+  // the change takes effect, then re-read state from the relay.
+  async function handleToggleListenIp(row: NetworkExposureRow) {
+    if (netBusyIp !== null) return;
+    netBusyIp = row.ip;
+    netError = null;
+    const next = toggleListenIp(netListenIps, row.ip, !row.enabled);
+    let persisted = false;
+    try {
+      await invoke('set_listen_ips', { ips: next });
+      persisted = true;
+      // Optimistically reflect the just-persisted list so the rows never
+      // blank out or show stale toggle state while the relay restarts.
+      netListenIps = next;
+      netRows = buildNetworkExposureRows(netInterfaces, next);
+      await restartRelay(invoke);
+    } catch (e) {
+      netError = e instanceof Error ? e.message : String(e);
+      console.error('Failed to update listen IPs:', e);
+    } finally {
+      // Refetch config-derived state even when the restart failed, so the
+      // UI stays consistent with what was persisted to disk; use an
+      // extended retry window to ride out a slow relay start.
+      if (persisted) await loadNetworkExposure(4);
+      netBusyIp = null;
+    }
+  }
+
+  let addingWriteDir = $state(false);
+
+  async function handleAddWriteDir() {
+    if (addingWriteDir) return;
+    addingWriteDir = true;
+    try {
+      const selected = await dialogOpen({
+        directory: true,
+        multiple: false,
+        title: 'Add write directory',
+      });
+      if (selected && typeof selected === 'string') {
+        await addWriteDir(selected);
+      }
+    } catch (e) {
+      console.error('Failed to pick write directory:', e);
+    } finally {
+      addingWriteDir = false;
+    }
+  }
+
+  async function saveObservabilityConfig() {
+    if (obsSaving || obsHasErrors) return;
+    obsSaving = true;
+    obsSaveError = null;
+    try {
+      const saved = await putObservabilityConfig({ ...obsConfig });
+      obsConfig = { ...saved };
+      obsBaseline = { ...saved };
+      obsSaved = true;
+      setTimeout(() => { obsSaved = false; }, 2000);
+    } catch (e) {
+      obsSaveError = e instanceof Error ? e.message : String(e);
+    } finally {
+      obsSaving = false;
     }
   }
 </script>
@@ -335,6 +506,40 @@
       </button>
     </div>
 
+    <div>
+      <div class="flex items-start justify-between gap-4">
+        <div>
+          <div class="text-sm font-medium">Write directories</div>
+          <div class="text-xs text-(--fg2) mt-0.5">Directories that sandbox scripts may write into. Scripts cannot write anywhere else on disk.</div>
+        </div>
+        <button
+          class="shrink-0 px-3 py-1.5 text-xs rounded-lg border border-(--border) hover:bg-(--surface-hover) text-(--fg2) transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+          onclick={handleAddWriteDir}
+          disabled={addingWriteDir}
+        >
+          Add directory…
+        </button>
+      </div>
+      {#if $writeDirs.length > 0}
+        <ul class="mt-2 space-y-1">
+          {#each $writeDirs as dir (dir)}
+            <li class="flex items-center justify-between gap-2 px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface)">
+              <span class="text-xs font-mono break-all">{dir}</span>
+              <button
+                class="shrink-0 text-xs text-(--fg2) hover:text-red-500 transition-colors"
+                onclick={() => removeWriteDir(dir)}
+                aria-label="Remove write directory {dir}"
+              >
+                Remove
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {:else}
+        <p class="mt-2 text-xs text-(--fg2)/70">No write directories configured.</p>
+      {/if}
+    </div>
+
     <div class="flex items-start justify-between gap-4">
       <div>
         <div class="text-sm font-medium">Start on Login</div>
@@ -444,6 +649,94 @@
     </div>
 
     <div class="pt-4 mt-4 border-t border-(--border)">
+      <div class="text-xs font-medium text-(--fg2) uppercase tracking-wide mb-3">Observability</div>
+
+      {#if obsLoading}
+        <p class="text-xs text-(--fg2)">Loading observability settings…</p>
+      {:else if obsUnavailable}
+        <div class="p-2 rounded bg-yellow-500/10 border border-yellow-500/20">
+          <p class="text-xs text-yellow-600 dark:text-yellow-400 font-medium">Observability is unavailable.</p>
+          <p class="text-xs text-yellow-600 dark:text-yellow-400 mt-1">The relay could not open the observability store, so its settings can't be edited right now.</p>
+        </div>
+      {:else}
+        <div class="flex items-start justify-between gap-4">
+          <div>
+            <div class="text-sm font-medium">Enable observability</div>
+            <div class="text-xs text-(--fg2) mt-0.5">Record metadata for every proxied tool call so you can inspect calls and aggregates.</div>
+          </div>
+          <button
+            class="shrink-0 relative w-10 h-5 rounded-full transition-colors {obsConfig.enabled ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'}"
+            onclick={() => obsConfig.enabled = !obsConfig.enabled}
+            role="switch"
+            aria-checked={obsConfig.enabled}
+            aria-label="Toggle observability"
+          >
+            <span class="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform {obsConfig.enabled ? 'translate-x-5' : ''}"></span>
+          </button>
+        </div>
+
+        <div class="mt-4 flex items-start justify-between gap-4" class:opacity-50={!obsConfig.enabled}>
+          <div>
+            <div class="text-sm font-medium">Store payloads</div>
+            <div class="text-xs text-(--fg2) mt-0.5">Capture full request/response payloads in the in-memory ring buffer. Metadata is still recorded when off.</div>
+          </div>
+          <button
+            class="shrink-0 relative w-10 h-5 rounded-full transition-colors {obsConfig.store_payloads ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'}"
+            onclick={() => obsConfig.store_payloads = !obsConfig.store_payloads}
+            disabled={!obsConfig.enabled}
+            role="switch"
+            aria-checked={obsConfig.store_payloads}
+            aria-label="Toggle payload capture"
+          >
+            <span class="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform {obsConfig.store_payloads ? 'translate-x-5' : ''}"></span>
+          </button>
+        </div>
+
+        {#each OBSERVABILITY_NUMERIC_FIELDS as field (field.key)}
+          {@const fieldEnabled = isFieldEnabled(field, obsConfig)}
+          <div class="mt-4" class:opacity-50={!fieldEnabled}>
+            <label for={`obs-${field.key}`} class="block text-xs font-medium mb-1 text-(--fg2)">
+              {field.label} <span class="text-(--fg2)/70">({field.unit})</span>
+            </label>
+            <input
+              id={`obs-${field.key}`}
+              type="number"
+              min={field.min}
+              step="1"
+              disabled={!fieldEnabled}
+              value={obsConfig[field.key]}
+              oninput={(e) => obsConfig[field.key] = coerceObservabilityNumber(field, (e.currentTarget as HTMLInputElement).value)}
+              class="w-40 text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) focus:outline-none focus:border-(--accent) disabled:cursor-not-allowed"
+            />
+            {#if obsErrors[field.key]}
+              <p class="text-xs text-red-600 dark:text-red-400 mt-1">{obsErrors[field.key]}</p>
+            {:else}
+              <p class="text-xs text-(--fg2)/70 mt-1">{field.hint}</p>
+            {/if}
+          </div>
+        {/each}
+
+        <div class="mt-4 flex items-center gap-3">
+          <button
+            class="px-3 py-1.5 text-xs rounded-lg border border-(--border) hover:bg-(--surface-hover) transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+            onclick={saveObservabilityConfig}
+            disabled={obsSaving || obsHasErrors || !obsDirty}
+          >
+            {obsSaving ? 'Saving…' : obsSaved ? '✓ Saved' : 'Save'}
+          </button>
+          {#if obsHasErrors}
+            <span class="text-xs text-red-600 dark:text-red-400">Fix the highlighted fields to save.</span>
+          {/if}
+        </div>
+        {#if obsSaveError}
+          <p class="text-xs text-red-600 dark:text-red-400 mt-2">Failed to save: {obsSaveError}</p>
+        {/if}
+      {/if}
+    </div>
+
+    <OrganizationsSection />
+
+    <div class="pt-4 mt-4 border-t border-(--border)">
       <div class="text-xs font-medium text-(--fg2) uppercase tracking-wide mb-2">Connection Info</div>
       <div class="space-y-3 mb-3">
         <div>
@@ -492,6 +785,76 @@
           </div>
         {/each}
       </div>
+    </div>
+
+    <!-- Network Exposure -->
+    <div class="pt-4 mt-4 border-t border-(--border)">
+      <div class="text-xs font-medium text-(--fg2) uppercase tracking-wide mb-2">Network Exposure</div>
+      <p class="text-xs text-(--fg2) mb-2">Choose which network interfaces the relay's MCP endpoint listens on.</p>
+
+      <div class="p-2 rounded bg-yellow-500/10 border border-yellow-500/20 mb-3">
+        <p class="text-xs text-yellow-600 dark:text-yellow-400 font-medium">Warning: enabling a non-loopback address exposes the MCP endpoint to other devices and users on that network, including potential attackers. Anyone who can reach it can invoke your configured tools.</p>
+      </div>
+
+      <div class="space-y-1.5">
+        <div class="flex items-center justify-between gap-2 px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface)">
+          <div class="min-w-0">
+            <span class="text-xs font-medium">Localhost</span>
+            <span class="text-xs font-mono ml-2 text-(--fg2)">127.0.0.1</span>
+            <span class="text-[0.65rem] text-(--fg2)/70 ml-2">always on</span>
+          </div>
+          <button
+            class="shrink-0 relative w-10 h-5 rounded-full bg-green-500 opacity-60 cursor-not-allowed"
+            disabled
+            role="switch"
+            aria-checked="true"
+            aria-label="Localhost listening (always on)"
+          >
+            <span class="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow translate-x-5"></span>
+          </button>
+        </div>
+
+        {#if netLoading}
+          <p class="text-xs text-(--fg2)">Detecting network interfaces…</p>
+        {:else}
+          {#if netUnavailable}
+            <p class="text-xs text-(--fg2)/70">Could not reach the relay to list network interfaces. Showing addresses from the saved configuration; you can still turn them off.</p>
+          {/if}
+          {#each netRows as row (row.ip)}
+            <div class="flex items-center justify-between gap-2 px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface)">
+              <div class="min-w-0">
+                <span class="text-xs font-medium">{row.name ?? 'Unknown interface'}</span>
+                <span class="text-xs font-mono ml-2 text-(--fg2)">{row.ip}</span>
+                {#if !row.detected}
+                  <span class="text-[0.65rem] px-1.5 py-0.5 rounded-full ml-2 bg-yellow-500/10 text-yellow-600 dark:text-yellow-400">not detected</span>
+                {/if}
+              </div>
+              <button
+                class="shrink-0 relative w-10 h-5 rounded-full transition-colors {row.enabled ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'} disabled:cursor-not-allowed disabled:opacity-60"
+                onclick={() => handleToggleListenIp(row)}
+                disabled={netBusyIp !== null}
+                role="switch"
+                aria-checked={row.enabled}
+                aria-label="Toggle listening on {row.ip}"
+              >
+                <span class="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform {row.enabled ? 'translate-x-5' : ''}"></span>
+              </button>
+            </div>
+          {:else}
+            {#if !netUnavailable}
+              <p class="text-xs text-(--fg2)/70">No eligible network interfaces detected.</p>
+            {/if}
+          {/each}
+        {/if}
+      </div>
+
+      {#if netBusyIp !== null}
+        <p class="text-xs text-(--fg2) mt-2">Applying change and restarting the relay…</p>
+      {:else if netError}
+        <p class="text-xs text-red-600 dark:text-red-400 mt-2">Failed to apply change: {netError}</p>
+      {:else}
+        <p class="text-xs text-(--fg2)/70 mt-2">The relay restarts automatically when you change these toggles.</p>
+      {/if}
     </div>
 
     {#if buildInfo}

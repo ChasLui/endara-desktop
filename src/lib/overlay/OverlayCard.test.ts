@@ -17,7 +17,7 @@ import { cardClick } from './overlay-actions';
 import type { ToolCallGroup, ToolCallRequest } from './toastStore';
 
 function req(over: Partial<ToolCallRequest> = {}): ToolCallRequest {
-  return { requestId: 'r-1', ts: 'ts', status: 'inflight', jsonrpcId: null, ...over };
+  return { requestId: 'r-1', ts: 'ts', status: 'inflight', logId: null, ...over };
 }
 
 function g(over: Partial<ToolCallGroup> = {}): ToolCallGroup {
@@ -35,6 +35,7 @@ function g(over: Partial<ToolCallGroup> = {}): ToolCallGroup {
     requests: [],
     lastUpdatedAt: 0,
     dismissAt: null,
+    dismissDurationMs: null,
     dismissTick: 0,
     ...over,
   };
@@ -106,9 +107,27 @@ describe('OverlayCard — visual state branches', () => {
     expect(groupVisualState(group)).toBe('inflight');
   });
 
-  it('destructive variant flips border + accent bar', () => {
-    const group = g({ annotations: { destructive: true } });
-    expect(isDestructive(group)).toBe(true);
+  it('drives the accent bar by call status, not destructiveness', () => {
+    // Mirrors OverlayCard.svelte's `accentBar` derivation:
+    //   inflight > 0 ? 'var(--accent)' : error > 0 ? 'var(--offline)' : null
+    const accentBar = (group: ToolCallGroup) =>
+      group.inflight > 0
+        ? 'var(--accent)'
+        : group.error > 0
+          ? 'var(--offline)'
+          : null;
+
+    // In-flight wins (blue) the entire time any call is in flight, even
+    // when some calls already failed.
+    expect(accentBar(g({ inflight: 1, error: 1, requests: [req()] }))).toBe('var(--accent)');
+    // Settled with any failed call (even alongside successes) → red.
+    expect(accentBar(g({ success: 2, error: 1 }))).toBe('var(--offline)');
+    // All-success → no bar.
+    expect(accentBar(g({ success: 3 }))).toBeNull();
+    // Destructive no longer drives the bar; the destructive pill still does.
+    const destructiveSuccess = g({ success: 1, annotations: { destructive: true } });
+    expect(isDestructive(destructiveSuccess)).toBe(true);
+    expect(accentBar(destructiveSuccess)).toBeNull();
   });
 });
 
@@ -119,7 +138,7 @@ describe('OverlayCard — hint pills', () => {
       open_world: true,
       read_only: true,
     });
-    expect(hints.map((h) => h.label)).toEqual(['read-only', 'open-world', 'destructive']);
+    expect(hints.map((h) => h.label)).toEqual(['read-only', 'open-world', 'makes changes']);
   });
 
   it('renders zero pills when annotations is undefined', () => {
@@ -130,31 +149,31 @@ describe('OverlayCard — hint pills', () => {
 describe('OverlayCard — click handler', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('invokes focus_main_window_on_log with the latest request jsonrpcId', async () => {
+  it('invokes focus_main_window_on_call with the latest request request_uid', async () => {
     const mockInvoke = vi.mocked(invoke);
     mockInvoke.mockResolvedValue(undefined);
 
     const group = g({
       requests: [
-        req({ requestId: 'a', status: 'success', durationMs: 12, jsonrpcId: 'rpc-1' }),
-        req({ requestId: 'b', status: 'success', durationMs: 14, jsonrpcId: 'rpc-2' }),
+        req({ requestId: 'a', status: 'success', durationMs: 12, logId: 'rpc-1' }),
+        req({ requestId: 'b', status: 'success', durationMs: 14, logId: 'rpc-2' }),
       ],
       success: 2,
     });
     expect(canFocusLog(group)).toBe(true);
 
     await cardClick(group);
-    expect(mockInvoke).toHaveBeenCalledWith('focus_main_window_on_log', {
-      jsonrpcId: 'rpc-2',
+    expect(mockInvoke).toHaveBeenCalledWith('focus_main_window_on_call', {
+      requestUid: 'rpc-2',
     });
   });
 
-  it('is a soft no-op when the latest request has null jsonrpcId', async () => {
+  it('is a soft no-op when the latest request has null logId', async () => {
     const mockInvoke = vi.mocked(invoke);
     mockInvoke.mockResolvedValue(undefined);
 
     const group = g({
-      requests: [req({ jsonrpcId: null })],
+      requests: [req({ logId: null })],
       inflight: 1,
     });
     expect(canFocusLog(group)).toBe(false);
@@ -228,6 +247,29 @@ describe('OverlayCard — caller label on row 2', () => {
     });
     const { callerLabel } = await import('./overlay-helpers');
     expect(callerLabel(group.client)).toBe('Claude Desktop');
+  });
+
+  it('prefers the relay friendly label over the raw client.name', async () => {
+    const group = g({
+      client: {
+        name: 'local-agent-mode-Endara Relay (via mcp-remote 0.1.37)',
+        label: 'Claude Cowork',
+      },
+      serverType: 'Linear',
+    });
+    const { callerLabel } = await import('./overlay-helpers');
+    expect(callerLabel(group.client)).toBe('Claude Cowork');
+  });
+
+  it('falls back to the name when the friendly label is absent', async () => {
+    const group = g({
+      client: { name: 'local-agent-mode-Endara Relay (via mcp-remote 0.1.37)' },
+      serverType: 'Linear',
+    });
+    const { callerLabel } = await import('./overlay-helpers');
+    expect(callerLabel(group.client)).toBe(
+      'local-agent-mode-Endara Relay (via mcp-remote 0.1.37)',
+    );
   });
 
   it('falls back to user_agent product token when name is absent', async () => {
@@ -339,7 +381,7 @@ describe('OverlayCard — per-card dismiss bar', () => {
     expect(src).toMatch(/class="tf-dismiss-bar"/);
     expect(src).toMatch(/class="tf-dismiss-fill"/);
     expect(src).toMatch(/style:background=\{barColor\}/);
-    expect(src).toMatch(/style:animation-duration="\{dismissDurationMs\}ms"/);
+    expect(src).toMatch(/style:animation-duration="\{barDurationMs\}ms"/);
     // No animation-play-state binding — hover-pause is gone.
     expect(src).not.toMatch(/animation-play-state/);
   });
@@ -347,5 +389,25 @@ describe('OverlayCard — per-card dismiss bar', () => {
   it('OverlayCard.svelte derives barTick from `group.dismissTick`', async () => {
     const src = (await import('./OverlayCard.svelte?raw')).default as string;
     expect(src).toMatch(/const barTick = \$derived\(group\.dismissTick\)/);
+  });
+
+  // The bar's CSS keyframe duration must read the value the store
+  // captured for THIS countdown (`group.dismissDurationMs`) so it stays
+  // in sync with the per-group `setTimeout`, falling back to the
+  // `dismissDurationMs` prop only when the group is not counting down.
+  it('OverlayCard.svelte derives barDurationMs from group.dismissDurationMs with the prop fallback', async () => {
+    const src = (await import('./OverlayCard.svelte?raw')).default as string;
+    expect(src).toMatch(
+      /const barDurationMs = \$derived\(group\.dismissDurationMs \?\? dismissDurationMs\)/,
+    );
+  });
+
+  // Logic mirror of the `$derived` above: an armed group's captured
+  // duration wins; a null (not-counting-down) group uses the prop.
+  it('bar duration uses group.dismissDurationMs when set, else the prop fallback', () => {
+    const barDurationMs = (group: ToolCallGroup, prop: number) =>
+      group.dismissDurationMs ?? prop;
+    expect(barDurationMs(g({ dismissDurationMs: 6000 }), 2000)).toBe(6000);
+    expect(barDurationMs(g({ dismissDurationMs: null }), 2000)).toBe(2000);
   });
 });

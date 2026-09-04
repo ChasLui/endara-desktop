@@ -4,14 +4,20 @@
     2. Mirror the main window's theme onto this window's
        `document.documentElement` via the shared `theme` store + matchMedia.
     3. Render the toast feed.
-    4. Toggle the overlay's ignore-cursor-events flag on pointer enter/leave
-       so the feed becomes interactive while hovered, click-through otherwise.
+
+  Click-through is owned by the Rust-side cursor poller: `ToastFeed` reports
+  the visible card hit rects via `set_overlay_hit_rects`, and Rust toggles
+  the window's ignore-cursor-events flag when the global cursor enters /
+  leaves a card. Renderer pointer handlers cannot do this — a click-through
+  window receives no pointer events from the OS, so `pointerenter` would
+  never fire (the production deadlock this design fixes).
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
-  import type { UnlistenFn } from '@tauri-apps/api/event';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { theme } from '$lib/stores';
   import { attachOverlayBridge } from './eventBridge';
+  import { focusCallForRequest } from './focusCall';
   import { createToastStore } from './toastStore';
   import { emitRenderReady } from './emitRenderReady';
   import {
@@ -20,16 +26,12 @@
     overlaySettings,
     subscribeOverlaySettingsChanges,
   } from './overlaySettingsStore';
-  import { overlayPointerEnter, overlayPointerLeave } from './overlay-actions';
   import ToastFeed from './ToastFeed.svelte';
   import './overlay.css';
 
-  // Pointer enter/leave toggle the Tauri ignore-cursor-events flag so
-  // the feed becomes interactive while hovered (clicking a card focuses
-  // the matching log row in the main window) and click-through
-  // otherwise. The per-card dismiss timer is intentionally NOT paused
-  // on hover — each card's countdown runs to completion regardless of
-  // cursor position.
+  // The per-card dismiss timer is intentionally NOT paused on hover —
+  // each card's countdown runs to completion regardless of cursor
+  // position.
 
   // One store instance per overlay-window lifetime. Seed with the persisted
   // defaults so the first render uses the correct dismiss timer + visible
@@ -79,6 +81,19 @@
       disposer = d;
     });
 
+    // Primary card-click path on macOS: the native click-catcher panel
+    // (see `src-tauri/src/overlay.rs`) emits `overlay:card-clicked` with the
+    // card's `log_id` when a click lands inside a reported rect. Route it
+    // through the same handler the DOM `onclick` uses. The DOM handler stays
+    // in place as a defensive fallback on platforms without the panel.
+    let cardClickUnlisten: UnlistenFn | null = null;
+    listen<{ log_id: string }>('overlay:card-clicked', (event) => {
+      const requestUid = event.payload?.log_id || null;
+      void focusCallForRequest(requestUid);
+    })
+      .then((un) => { cardClickUnlisten = un; })
+      .catch((e) => console.warn('[overlay] card-clicked subscribe failed:', e));
+
     // Signal Rust that the renderer has actually painted a frame so the
     // window can be revealed without the brief white flash that the
     // `on_page_load` reveal produced. See `emitRenderReady.ts` for the
@@ -89,6 +104,7 @@
       unsubTheme();
       unsubSettings();
       if (settingsUnlisten) settingsUnlisten();
+      if (cardClickUnlisten) cardClickUnlisten();
       if (disposer) disposer().catch((e) => console.warn('[overlay] disposer failed:', e));
     };
   });
@@ -99,17 +115,13 @@
   <title>Endara Overlay</title>
 </svelte:head>
 
-<div
-  class="overlay-root"
-  onpointerenter={() => { void overlayPointerEnter(); }}
-  onpointerleave={() => { void overlayPointerLeave(); }}
-  role="presentation"
->
+<div class="overlay-root">
   <ToastFeed
     {store}
     position={$overlaySettings.position}
     maxVisible={$overlaySettings.max_visible}
     showProfile={$overlaySettings.show_profile}
+    dismissMs={$overlaySettings.auto_dismiss_ms}
   />
 </div>
 

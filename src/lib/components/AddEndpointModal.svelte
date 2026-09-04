@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { addEndpoint, getEndpoints, testConnection, oauthSetup, oauthSetupStatus, oauthSetupCredentials, oauthSetupCommit, oauthSetupCancel, reloadConfig, type AddEndpointParams, type TestConnectionParams, type OAuthSetupParams } from '$lib/api';
+  import { addEndpoint, getEndpoints, getStatus, testConnection, oauthProbe, oauthSetup, oauthSetupStatus, oauthSetupCredentials, oauthSetupCommit, oauthSetupCancel, reloadConfig, type AddEndpointParams, type TestConnectionParams, type OAuthSetupParams } from '$lib/api';
+  import type { OAuthProbeResult } from '$lib/types';
   import { endpoints, selectedEndpoint } from '$lib/stores';
   import { toast } from 'svelte-sonner';
   import { CATALOG_SERVERS, type CatalogServer } from '$lib/catalog';
@@ -11,14 +12,27 @@
     validateAddEndpointForm,
     firstAddEndpointFieldError,
     computeAddEndpointIsDirty,
+    resolveIsolation,
+    orgBindingApplies,
+    serializeMountRows,
+    mountRowError,
+    hasMountRowErrors,
+    buildMountExample,
+    buildOrgBoundEndpointParams,
+    buildCatalogEnvAndHeaders,
+    mergeHeaders,
     type AddEndpointFieldErrors,
     type AddEndpointFormSnapshot,
+    type MountRow,
   } from './add-endpoint-helpers';
+  import { organizations, refreshOrganizations } from '$lib/stores/organizations';
   import { sanitizeName } from '$lib/utils';
   import { focusTrap } from '$lib/actions/focusTrap';
   import ConfirmModal from './ConfirmModal.svelte';
+  import ConnectOrgModal from './ConnectOrgModal.svelte';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { open as dialogOpen } from '@tauri-apps/plugin-dialog';
+  import { homeDir } from '@tauri-apps/api/path';
 
   type TransportType = 'stdio' | 'sse' | 'http' | 'oauth';
   type Step = 'browse' | 'configure';
@@ -28,6 +42,10 @@
   let step: Step = $state('browse');
   let selectedCatalog: CatalogServer | null = $state(null);
   let search = $state('');
+  // When true, the organization onboarding flow (provider → SSO → detect →
+  // review) is layered over the add-server surface. Launched from the browse
+  // step's "Connect an organization" entry.
+  let showConnectOrg = $state(false);
 
   // Configure step fields
   let transport: TransportType = $state('stdio');
@@ -38,6 +56,10 @@
   let command = $state('');
   let args = $state('');
   let url = $state('');
+  // Custom configure step only: when set, binds the new server to an existing
+  // organization so it authenticates via that org's shared EMA credentials
+  // (auth.type="ema") instead of its own per-server OAuth. Empty = "None".
+  let selectedOrganization = $state('');
   let envVars: { key: string; value: string }[] = $state([]);
   let headerVars: { key: string; value: string }[] = $state([]);
   let catalogEnvValues: Record<string, string> = $state({});
@@ -56,6 +78,12 @@
   let clientSecret = $state('');
   let scopes = $state('');
   let selectedScopes: Set<string> = $state(new Set());
+  // Optional EMA resource pairing credential (R3), settable at add-time on the
+  // org-bound custom flow. Mirrors the D2 Config-tab fields: id is editable,
+  // secret is write-only. Blank fields => no resource cred sent on create.
+  let orgBoundScopes = $state('');
+  let resourceClientId = $state('');
+  let resourceClientSecret = $state('');
   let selectedOAuthEntry: OAuthCatalogEntry | null = $state(null);
   let showingDcrFallback = $state(false);
   let dcrFallbackData: { authorization_endpoint?: string } = $state({});
@@ -64,6 +92,11 @@
   let pendingSetupSessionId: string | null = $state(null);
   let setupAuthCancelled = $state(false);
   let cancelHint = $state('');
+  // Add-time OAuth detection (http/sse only). When the probe reports the
+  // server supports OAuth, this opt-out prompt offers to escalate into the
+  // existing OAuth wizard; declining proceeds with a plain unauthenticated add.
+  let showOAuthEscalation = $state(false);
+  let oauthProbeData: { authorization_server?: string; scopes_supported?: string[] } | null = $state(null);
   // Optional override that replaces the upstream-reported server name in the
   // relay's connected-servers advertisement. Pre-populated from the catalog
   // entry's `serverTypeOverride` default when one exists.
@@ -92,6 +125,51 @@
   // value at ≤64 chars, but pasted content can occasionally bypass that on
   // some platforms. Surface a hint if it ever happens.
   let serverTypeOverrideTooLong = $derived(serverTypeOverride.length > 64);
+  // Isolation toggle for stdio endpoints — default ON so new endpoints
+  // containerize by default. The submit path always sends an explicit
+  // "container"/"none" value (see resolveIsolation).
+  let isolationEnabled = $state(true);
+  // True when the active catalog entry is flagged not-containerizable —
+  // the toggle is replaced by a "Not containerized" notice and the endpoint
+  // is created with isolation = "none".
+  let catalogNotContainerizable = $derived.by(() => selectedCatalog?.containerizable === false);
+  // Volume mounts (stdio + container isolation only) — host/container path
+  // pairs sent as the relay's `mounts: string[]`. Mirrors the env-var editor.
+  let mountRows: MountRow[] = $state([]);
+  // The mount section is only meaningful when the endpoint will actually run
+  // in a container — i.e. stdio, isolation ON, and not a flagged catalog entry.
+  let showMounts = $derived(transport === 'stdio' && isolationEnabled && !catalogNotContainerizable);
+  // Resolved user home directory, used to build a valid absolute-path mount
+  // example. Left null until Tauri resolves it (or on failure), so the
+  // example falls back to a generic absolute path.
+  let homeDirPath: string | null = $state(null);
+  homeDir()
+    .then((h) => { homeDirPath = h; })
+    .catch(() => { /* leave null — buildMountExample falls back */ });
+  let mountExample = $derived(buildMountExample(homeDirPath));
+  // null = unknown (older relay or status fetch failed); only an explicit
+  // `false` from the relay drives the "no runtime" inline notice.
+  let containerRuntimeAvailable: boolean | null = $state(null);
+  let runtimeMissing = $derived(containerRuntimeAvailable === false);
+  getStatus()
+    .then((s) => { containerRuntimeAvailable = s.container_runtime_available ?? null; })
+    .catch(() => { /* relay unreachable — leave runtime availability unknown */ });
+
+  // Populate the custom configure step's Organization selector. Best-effort —
+  // on failure the store stays empty and the selector renders disabled with a
+  // "Connect an organization" hint instead of an empty dropdown.
+  refreshOrganizations().catch(() => { /* relay unreachable — leave list empty */ });
+
+  // The Organization selector only applies to the custom (non-catalog) add
+  // flow and only for transports the relay accepts EMA on — currently `http`
+  // and `oauth` (see `orgBindingApplies`). EMA endpoints are built as `http`
+  // by construction (see `buildOrgBoundEndpointParams`); under an `oauth`
+  // selection that just means the org-bound add routes through the EMA `http`
+  // path and the per-server OAuth setup is dropped. `sse`/`stdio` never show
+  // the selector. `orgBound` is true once an org is actually chosen, switching
+  // submit to the plain EMA add path and bypassing `handleOAuthSubmit`.
+  let orgSelectorVisible = $derived(!selectedCatalog && !selectedOAuthEntry && orgBindingApplies(transport));
+  let orgBound = $derived(orgSelectorVisible && selectedOrganization.trim() !== '');
 
   // Captured at the moment `step` transitions to `'configure'` so any
   // catalog pre-fills (name, command, args, etc.) become the dirty-check
@@ -118,7 +196,12 @@
       clientId,
       clientSecret,
       scopes,
+      orgBoundScopes,
+      resourceClientId,
+      resourceClientSecret,
       serverTypeOverride,
+      isolationEnabled,
+      mounts: mountRows,
     });
   });
   let showDiscardConfirm = $state(false);
@@ -139,7 +222,12 @@
       clientId,
       clientSecret,
       scopes,
+      orgBoundScopes,
+      resourceClientId,
+      resourceClientSecret,
       serverTypeOverride,
+      isolationEnabled,
+      mounts: mountRows.map((m) => ({ host: m.host, container: m.container })),
     };
   }
 
@@ -209,9 +297,13 @@
     description = service.description;
     transport = 'oauth';
     url = service.url;
+    selectedOrganization = '';
     oauthServerUrl = service.oauthServerUrl || '';
     clientId = '';
     clientSecret = '';
+    orgBoundScopes = '';
+    resourceClientId = '';
+    resourceClientSecret = '';
     if (service.availableScopes && service.availableScopes.length > 0) {
       scopes = '';
       selectedScopes = new Set(service.defaultScopes);
@@ -228,6 +320,8 @@
     dcrClientSecret = '';
     serverTypeOverride = service.serverTypeOverride ?? '';
     serverTypeOverrideHasDefault = Boolean(service.serverTypeOverride);
+    isolationEnabled = true;
+    mountRows = [];
     error = '';
     fieldErrors = {};
     originalSnapshot = captureSnapshot();
@@ -242,8 +336,10 @@
     prefix = sanitizeName(server.name);
     description = server.description;
     transport = server.transport;
-    command = server.command;
-    args = server.args.join(' ');
+    command = server.command ?? '';
+    args = (server.args ?? []).join(' ');
+    url = server.url ?? '';
+    selectedOrganization = '';
     catalogEnvValues = {};
     userArgValues = server.userArgs ? server.userArgs.map(() => '') : [];
     envVars = [];
@@ -253,9 +349,14 @@
     clientSecret = '';
     scopes = '';
     selectedScopes = new Set();
+    orgBoundScopes = '';
+    resourceClientId = '';
+    resourceClientSecret = '';
     showingDcrFallback = false;
     serverTypeOverride = server.serverTypeOverride ?? '';
     serverTypeOverrideHasDefault = Boolean(server.serverTypeOverride);
+    isolationEnabled = true;
+    mountRows = [];
     error = '';
     fieldErrors = {};
     originalSnapshot = captureSnapshot();
@@ -273,6 +374,7 @@
     command = '';
     args = '';
     url = '';
+    selectedOrganization = '';
     envVars = [];
     headerVars = [];
     catalogEnvValues = {};
@@ -282,9 +384,14 @@
     clientSecret = '';
     scopes = '';
     selectedScopes = new Set();
+    orgBoundScopes = '';
+    resourceClientId = '';
+    resourceClientSecret = '';
     showingDcrFallback = false;
     serverTypeOverride = '';
     serverTypeOverrideHasDefault = false;
+    isolationEnabled = true;
+    mountRows = [];
     error = '';
     fieldErrors = {};
     originalSnapshot = captureSnapshot();
@@ -339,25 +446,20 @@
       params.url = url.trim();
     }
 
-    // Build env
-    const env: Record<string, string> = {};
-    if (selectedCatalog) {
-      for (const ev of selectedCatalog.envVars) {
-        const val = catalogEnvValues[ev.name] ?? '';
-        if (val.trim()) env[ev.name] = val.trim();
-      }
-    }
+    // Build env: catalog env vars + custom env vars
+    const catalogValues = selectedCatalog
+      ? buildCatalogEnvAndHeaders(selectedCatalog, catalogEnvValues)
+      : { env: {}, headers: {} };
+    const env: Record<string, string> = { ...catalogValues.env };
     for (const e of envVars.filter((e) => e.key.trim())) {
       env[e.key.trim()] = e.value;
     }
     if (Object.keys(env).length > 0) params.env = env;
 
-    // Build headers
+    // Build headers: catalog header-typed vars + custom headers (custom wins,
+    // matched case-insensitively)
     if (transport !== 'stdio') {
-      const headers: Record<string, string> = {};
-      for (const h of headerVars.filter((h) => h.key.trim())) {
-        headers[h.key.trim()] = h.value;
-      }
+      const headers = mergeHeaders(catalogValues.headers, headerVars);
       if (Object.keys(headers).length > 0) params.headers = headers;
     }
 
@@ -392,7 +494,7 @@
     }
   }
 
-  async function handleSubmit() {
+  async function handleSubmit(opts?: { skipProbe?: boolean }) {
     error = '';
     cancelHint = '';
     const errs = validateAddEndpointForm({ transport, name, command, url });
@@ -401,6 +503,82 @@
       error = firstAddEndpointFieldError(errs);
       return;
     }
+
+    // Org-bound (EMA) custom endpoint: bind the server to the selected
+    // organization and add it directly as an `auth.type="ema"` http endpoint,
+    // reusing the org's shared ID token. This skips the per-server OAuth
+    // probe/escalation + browser-SSO path entirely — no per-server auth needed.
+    const emaParams = buildOrgBoundEndpointParams(
+      orgBound ? selectedOrganization : '',
+      {
+        name,
+        url,
+        description,
+        scopes: orgBoundScopes,
+        resourceClientId,
+        resourceClientSecret,
+      },
+    );
+    if (emaParams) {
+      submitting = true;
+      try {
+        await addEndpoint(emaParams);
+        try {
+          const data = await getEndpoints();
+          endpoints.set(data);
+        } catch {
+          // Mutation already succeeded — silent on purpose (see plain-add path).
+        }
+        selectedEndpoint.set(emaParams.name);
+        toast.success(`Server "${emaParams.name}" added`);
+        onclose();
+      } catch (e) {
+        error = e instanceof Error ? e.message : String(e);
+      } finally {
+        submitting = false;
+      }
+      return;
+    }
+
+    // Catalog env/header values are needed both to gate the OAuth probe below
+    // and to build the add params further down.
+    const catalogValues = selectedCatalog
+      ? buildCatalogEnvAndHeaders(selectedCatalog, catalogEnvValues)
+      : { env: {}, headers: {} };
+    const hasCatalogHeaderCredentials = Object.keys(catalogValues.headers).length > 0;
+
+    // Add-time OAuth detection (http/sse only). Best-effort + non-blocking:
+    // probe the entered URL and, if the server advertises OAuth, surface the
+    // opt-out escalation prompt instead of adding. Any probe failure / timeout
+    // / `oauth_supported:false` silently falls through to the plain add below.
+    // Skipped when the catalog entry already supplies header credentials (e.g.
+    // the GitHub bearer PAT): the user has chosen that auth model, and the
+    // escalation prompt would misdescribe the add as unauthenticated.
+    if (
+      !opts?.skipProbe &&
+      !hasCatalogHeaderCredentials &&
+      (transport === 'http' || transport === 'sse')
+    ) {
+      submitting = true;
+      let probe: OAuthProbeResult = { oauth_supported: false };
+      try {
+        probe = await oauthProbe(url.trim());
+      } catch {
+        // oauthProbe never throws, but stay defensive — fall through to add.
+      }
+      if (probe.oauth_supported) {
+        submitting = false;
+        oauthProbeData = {
+          authorization_server: probe.authorization_server,
+          scopes_supported: probe.scopes_supported,
+        };
+        showOAuthEscalation = true;
+        return;
+      }
+      // Not OAuth-capable — keep `submitting` true and proceed with the plain
+      // add below; its own `finally` resets the flag.
+    }
+
     const trimmedName = name.trim();
     const defaultPrefix = sanitizeName(trimmedName);
 
@@ -433,6 +611,27 @@
       if (finalArgs.length > 0) {
         params.args = finalArgs;
       }
+
+      // Always explicit for stdio — the relay treats an omitted field as
+      // direct spawn, so "container"/"none" is never left implicit.
+      params.isolation = resolveIsolation(
+        transport,
+        !catalogNotContainerizable,
+        isolationEnabled,
+      );
+
+      // Volume mounts only apply to containerized stdio endpoints. Block on
+      // any malformed row, then send the serialized array (omitted when empty).
+      if (params.isolation === 'container') {
+        if (hasMountRowErrors(mountRows)) {
+          error = 'Fix the highlighted volume mount rows before continuing.';
+          return;
+        }
+        const mounts = serializeMountRows(mountRows);
+        if (mounts.length > 0) {
+          params.mounts = mounts;
+        }
+      }
     } else if (transport === 'oauth') {
       params.url = url.trim();
       if (oauthServerUrl.trim()) params.oauth_server_url = oauthServerUrl.trim();
@@ -448,13 +647,7 @@
     }
 
     // Build env: catalog env vars + custom env vars
-    const env: Record<string, string> = {};
-    if (selectedCatalog) {
-      for (const ev of selectedCatalog.envVars) {
-        const val = catalogEnvValues[ev.name] ?? '';
-        if (val.trim()) env[ev.name] = val.trim();
-      }
-    }
+    const env: Record<string, string> = { ...catalogValues.env };
     const filteredEnv = envVars.filter((e) => e.key.trim());
     for (const e of filteredEnv) {
       env[e.key.trim()] = e.value;
@@ -463,13 +656,10 @@
       params.env = env;
     }
 
-    // Build headers from key-value pairs
+    // Build headers: catalog header-typed vars + custom headers (custom wins,
+    // matched case-insensitively)
     if (transport !== 'stdio') {
-      const headers: Record<string, string> = {};
-      const filteredHeaders = headerVars.filter((h) => h.key.trim());
-      for (const h of filteredHeaders) {
-        headers[h.key.trim()] = h.value;
-      }
+      const headers = mergeHeaders(catalogValues.headers, headerVars);
       if (Object.keys(headers).length > 0) {
         params.headers = headers;
       }
@@ -499,6 +689,31 @@
     } finally {
       submitting = false;
     }
+  }
+
+  // Accept the escalation: switch the form to the OAuth transport (the server
+  // URL the user already entered carries over in `url`) and kick off the
+  // existing OAuth setup wizard.
+  function acceptOAuthEscalation() {
+    showOAuthEscalation = false;
+    oauthProbeData = null;
+    transport = 'oauth';
+    void handleOAuthSubmit();
+  }
+
+  // Decline the escalation: add the endpoint as a plain unauthenticated
+  // http/sse server exactly as before. `skipProbe` avoids re-probing.
+  function declineOAuthEscalation() {
+    showOAuthEscalation = false;
+    oauthProbeData = null;
+    void handleSubmit({ skipProbe: true });
+  }
+
+  // Dismiss the prompt without choosing (Escape / backdrop) — return to the
+  // form untouched so the user can adjust the URL or decide later.
+  function dismissOAuthEscalation() {
+    showOAuthEscalation = false;
+    oauthProbeData = null;
   }
 
   async function handleOAuthSubmit() {
@@ -744,6 +959,23 @@
       <!-- Step 1: Browse Catalog -->
       <h3 class="text-base font-semibold mb-4 text-(--fg1)">Add Server</h3>
 
+      <!-- Organization onboarding entry point. Launches the connect-an-org
+           flow (provider → SSO → detect → review) layered over this surface. -->
+      <button
+        class="w-full text-left p-3 mb-4 rounded-lg border border-(--accent)/40 bg-(--accent)/5 hover:bg-(--accent)/10 transition-colors flex items-center gap-3"
+        onclick={() => (showConnectOrg = true)}
+      >
+        <span class="w-5 h-5 flex-shrink-0 text-(--accent)">
+          <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3 21v-2a4 4 0 014-4h4M21 21v-2a4 4 0 00-3-3.87M9 7a4 4 0 108 0 4 4 0 00-8 0zM19 8v6m3-3h-6" />
+          </svg>
+        </span>
+        <span class="min-w-0">
+          <span class="block text-sm font-medium text-(--fg1)">Connect an organization</span>
+          <span class="block text-xs text-(--fg2)">Sign in once and detect the MCP servers your org grants</span>
+        </span>
+      </button>
+
       <input
         type="text"
         bind:value={search}
@@ -826,6 +1058,14 @@
                     API Key
                   </span>
                 {/if}
+                {#if server.containerizable === false}
+                  <span
+                    class="inline-block text-[10px] px-1.5 py-0.5 rounded-full bg-(--surface-hover) text-(--fg2) border border-(--border) font-medium"
+                    title={server.containerNote}
+                  >
+                    Not containerized
+                  </span>
+                {/if}
               </div>
             </button>
           {/if}
@@ -891,7 +1131,7 @@
           </fieldset>
         {/if}
 
-        <div>
+        <div class="mt-2">
           <label for="modal-ep-name" class="block text-xs font-medium mb-1 text-(--fg2)">Name</label>
           <input id="modal-ep-name" type="text" bind:value={name} placeholder="my-server"
             aria-invalid={!!fieldErrors.name}
@@ -931,6 +1171,49 @@
             class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
         </div>
 
+        <!-- Organization binding (custom add only, http + oauth transports).
+             Selecting an org makes the server authenticate via that org's
+             shared EMA credentials instead of its own per-server OAuth — the
+             submit then routes through `buildOrgBoundEndpointParams` which
+             builds a plain `http` EMA endpoint, dropping the per-server OAuth
+             setup entirely. -->
+        {#if orgSelectorVisible}
+          <div>
+            <label for="modal-ep-org" class="block text-xs font-medium mb-1 text-(--fg2)">Organization <span class="text-(--fg2)/50">(optional)</span></label>
+            <select
+              id="modal-ep-org"
+              bind:value={selectedOrganization}
+              disabled={$organizations.length === 0}
+              class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) focus:outline-none focus:border-(--accent) disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <option value="">None — use this server's own authentication.</option>
+              {#each $organizations as org (org.name)}
+                <option value={org.name}>{org.name}</option>
+              {/each}
+            </select>
+            {#if $organizations.length === 0}
+              <p class="text-[11px] text-(--fg2) mt-0.5">
+                No organizations yet — use “Connect an organization” to sign in once and share its credentials across servers.
+              </p>
+            {:else if !orgBound}
+              <p class="text-[11px] text-(--fg2) mt-0.5">
+                Bind this server to an organization to authenticate with its shared credentials instead of per-server OAuth.
+              </p>
+            {/if}
+          </div>
+          {#if orgBound}
+            <!-- EMA outcome notice. Shown for both http and oauth selections
+                 once an org is chosen, since the submit path collapses to the
+                 same `auth.type="ema"` http endpoint and per-server OAuth is
+                 dropped. -->
+            <div class="px-3 py-2 rounded-lg border border-(--border) bg-(--surface-hover)">
+              <p class="text-[11px] text-(--fg2)">
+                This server will be added as an organization-managed (EMA) endpoint and use <strong>{selectedOrganization}</strong>'s shared credentials instead of its own OAuth.
+              </p>
+            </div>
+          {/if}
+        {/if}
+
         {#if transport === 'stdio'}
           <div>
             <label for="modal-ep-cmd" class="block text-xs font-medium mb-1 text-(--fg2)">Command</label>
@@ -944,6 +1227,44 @@
             <input id="modal-ep-args" type="text" bind:value={args} placeholder="-y @modelcontextprotocol/server-filesystem /tmp"
               class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
           </div>
+
+          <!-- Isolation setting (stdio only). Flagged catalog entries can't
+               containerize — show the badge + reason instead of the toggle. -->
+          {#if catalogNotContainerizable}
+            <div class="flex items-start gap-2 px-3 py-2 rounded-lg border border-(--border) bg-(--surface-hover)">
+              <span class="inline-block text-[10px] px-1.5 py-0.5 rounded-full bg-(--surface) text-(--fg2) border border-(--border) font-medium flex-shrink-0">
+                Not containerized
+              </span>
+              <p class="text-[11px] text-(--fg2)">
+                {selectedCatalog?.containerNote} This server runs directly on your machine.
+              </p>
+            </div>
+          {:else}
+            <div>
+              <div class="flex items-center justify-between gap-2">
+                <label for="modal-ep-isolation" class="text-xs font-medium text-(--fg2)">
+                  Run in container <span class="text-(--fg2)/50">(isolation)</span>
+                </label>
+                <button
+                  id="modal-ep-isolation"
+                  type="button"
+                  class="tgl {isolationEnabled ? '' : 'tgl-off'}"
+                  role="switch"
+                  aria-checked={isolationEnabled}
+                  title={isolationEnabled ? 'Disable container isolation' : 'Enable container isolation'}
+                  onclick={() => isolationEnabled = !isolationEnabled}
+                ><span></span></button>
+              </div>
+              <p class="text-[11px] text-(--fg2) mt-0.5">
+                Runs the server in an isolated container (Docker or Podman) instead of directly on your machine.
+              </p>
+              {#if runtimeMissing && isolationEnabled}
+                <p class="text-[11px] text-(--attention) mt-1">
+                  No container runtime detected — the server will fall back to running directly on your machine. Install Docker or Podman to enable isolation.
+                </p>
+              {/if}
+            </div>
+          {/if}
         {:else if transport === 'oauth'}
           <div>
             <label for="modal-ep-url" class="block text-xs font-medium mb-1 text-(--fg2)">Server URL</label>
@@ -953,6 +1274,10 @@
               class="w-full text-sm px-3 py-1.5 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) {fieldErrors.url ? 'border-(--offline)' : 'border-(--border)'}" />
           </div>
 
+          {#if !orgBound}
+          <!-- Per-server OAuth fields are dropped when an org is bound — the
+               EMA `http` endpoint reuses the org's shared credentials instead.
+               The user-facing explainer lives in the shared notice above. -->
           <!-- Curated scope checkbox list (only when the catalog entry exposes availableScopes) -->
           {#if scopeMode === 'checkbox' && selectedOAuthEntry?.availableScopes}
             <div>
@@ -1045,6 +1370,7 @@
               </div>
             </div>
           </details>
+          {/if}
         {:else}
           <div>
             <label for="modal-ep-url" class="block text-xs font-medium mb-1 text-(--fg2)">URL</label>
@@ -1141,6 +1467,49 @@
           {/each}
         </div>
 
+        <!-- Volume mounts (containerized stdio only) — host/container bind
+             pairs sent to the relay as `mounts: string[]`. -->
+        {#if showMounts}
+          <div>
+            <div class="flex items-center justify-between mb-1">
+              <span class="block text-xs font-medium text-(--fg2)">
+                Volume mounts
+                <span class="text-(--fg2)/50">(optional)</span>
+              </span>
+              <button
+                type="button"
+                class="text-xs text-(--accent) hover:text-(--accent-hover)"
+                onclick={() => mountRows = [...mountRows, { host: '', container: '' }]}
+              >
+                + Add
+              </button>
+            </div>
+            {#each mountRows as mount, i}
+              {@const rowError = mountRowError(mount)}
+              <div class="flex gap-1 mb-1">
+                <input type="text" bind:value={mount.host} placeholder="/host/path"
+                  aria-invalid={!!rowError}
+                  class="flex-1 text-sm px-2 py-1 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) font-mono {rowError ? 'border-(--offline)' : 'border-(--border)'}" />
+                <span class="self-center text-xs text-(--fg2)">:</span>
+                <input type="text" bind:value={mount.container} placeholder="/container/path"
+                  aria-invalid={!!rowError}
+                  class="flex-1 text-sm px-2 py-1 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) font-mono {rowError ? 'border-(--offline)' : 'border-(--border)'}" />
+                <button
+                  type="button"
+                  class="text-xs px-1.5 text-(--fg2) hover:text-(--offline)"
+                  onclick={() => mountRows = mountRows.filter((_, idx) => idx !== i)}
+                >✕</button>
+              </div>
+              {#if rowError}
+                <p class="text-[11px] text-(--offline) mb-1">{rowError}</p>
+              {/if}
+            {/each}
+            <p class="text-[11px] text-(--fg2) mt-0.5">
+              Bind host paths into the container, e.g. <code>{mountExample}</code>.
+            </p>
+          </div>
+        {/if}
+
         <!-- Custom HTTP headers (SSE/HTTP only) -->
         {#if transport !== 'stdio'}
           <div>
@@ -1173,40 +1542,89 @@
           </div>
         {/if}
 
-        <!-- Generic Advanced section for non-OAuth transports. Auto-expanded
-             when the catalog entry ships a default `serverTypeOverride`. -->
-        {#if transport !== 'oauth'}
+        <!-- Generic Advanced section. Gated to render for non-oauth
+             transports OR any org-bound selection: org-bound OAUTH still
+             collapses to an EMA http endpoint at submit, so the EMA fields
+             (Scopes + Resource Client ID/Secret) belong here even on the
+             oauth transport. Auto-expanded when the catalog entry ships a
+             default `serverTypeOverride`. -->
+        {#if orgBound || transport !== 'oauth'}
           <details class="border border-(--border) rounded-lg" open={serverTypeOverrideHasDefault}>
             <summary class="px-3 py-2 text-xs font-medium text-(--fg2) cursor-pointer hover:bg-(--surface-hover) rounded-lg select-none">
               Advanced
             </summary>
             <div class="px-3 pb-3 space-y-3">
-              <div>
-                <label for="modal-ep-server-type-override-generic" class="block text-xs font-medium mb-1 text-(--fg2)">Server type override <span class="text-(--fg2)/50">(optional)</span></label>
-                <input
-                  id="modal-ep-server-type-override-generic"
-                  type="text"
-                  bind:value={serverTypeOverride}
-                  placeholder="e.g. my-server"
-                  maxlength={64}
-                  class="w-full text-sm px-3 py-1.5 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) {serverTypeOverrideInvalid || serverTypeOverrideTooLong ? 'border-(--offline)' : 'border-(--border)'}" />
-                <p class="text-[11px] text-(--fg2) mt-0.5">Optional. Replaces the name this server reports to MCP clients. Max 64 characters.</p>
-                {#if serverTypeOverridePreviewVisible}
-                  <p class="text-[11px] text-(--fg2) mt-0.5">Will be saved as: <code>{serverTypeOverrideSanitized}</code></p>
-                {/if}
-                {#if serverTypeOverrideInvalid}
-                  <p class="text-[11px] text-(--offline) mt-0.5">No usable characters — please include lowercase letters, digits, <code>-</code>, or <code>_</code>.</p>
-                {/if}
-                {#if serverTypeOverrideTooLong}
-                  <p class="text-[11px] text-(--offline) mt-0.5">Maximum 64 characters.</p>
-                {/if}
-              </div>
+              {#if orgBound}
+                <!-- Optional EMA scopes + resource pairing credential.
+                     `scopes` lands in the endpoint's `config.toml` (drives
+                     R2's IdP scope on first sign-in); the resource pair is
+                     stripped by `addEndpoint()` and POSTed to
+                     `/api/endpoints/{name}/credentials` (DCR file, chmod
+                     0600), never in `config.toml`. Mirrors the D2 Config-tab
+                     fields' labels and UX. -->
+                <div>
+                  <label for="modal-ep-orgbound-scopes" class="block text-xs font-medium mb-1 text-(--fg2)">Scopes <span class="text-(--fg2)/50">(optional, space-separated)</span></label>
+                  <input id="modal-ep-orgbound-scopes" type="text" bind:value={orgBoundScopes} placeholder="read write"
+                    class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
+                  <p class="text-[11px] text-(--fg2) mt-0.5">Space-separated. Leave blank for server defaults.</p>
+                </div>
+                <div>
+                  <label for="modal-ep-orgbound-resource-client-id" class="block text-xs font-medium mb-1 text-(--fg2)">
+                    Resource Client ID <span class="text-(--fg2)/50">(optional)</span>
+                  </label>
+                  <input id="modal-ep-orgbound-resource-client-id" type="text" bind:value={resourceClientId}
+                    placeholder="Resource (MAS) client ID"
+                    class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
+                  <p class="text-[11px] text-(--fg2) mt-0.5">
+                    Only for MCP servers that require a separate client at the Step-3 token exchange. Leave blank for everything else.
+                  </p>
+                </div>
+                <div>
+                  <label for="modal-ep-orgbound-resource-client-secret" class="block text-xs font-medium mb-1 text-(--fg2)">
+                    Resource Client Secret <span class="text-(--fg2)/50">(optional)</span>
+                  </label>
+                  <input id="modal-ep-orgbound-resource-client-secret" type="password" autocomplete="new-password" bind:value={resourceClientSecret}
+                    placeholder=""
+                    class="w-full text-sm px-3 py-1.5 rounded-lg border border-(--border) bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent)" />
+                  <p class="text-[11px] text-(--fg2) mt-0.5">
+                    Paired with the resource client ID. Stored in the owner-scoped credential directory, separate from <code>config.toml</code>.
+                  </p>
+                </div>
+              {/if}
+              {#if transport !== 'oauth'}
+                <div>
+                  <label for="modal-ep-server-type-override-generic" class="block text-xs font-medium mb-1 text-(--fg2)">Server type override <span class="text-(--fg2)/50">(optional)</span></label>
+                  <input
+                    id="modal-ep-server-type-override-generic"
+                    type="text"
+                    bind:value={serverTypeOverride}
+                    placeholder="e.g. my-server"
+                    maxlength={64}
+                    class="w-full text-sm px-3 py-1.5 rounded-lg border bg-(--surface) text-(--fg1) placeholder:text-(--fg2)/50 focus:outline-none focus:border-(--accent) {serverTypeOverrideInvalid || serverTypeOverrideTooLong ? 'border-(--offline)' : 'border-(--border)'}" />
+                  <p class="text-[11px] text-(--fg2) mt-0.5">Optional. Replaces the name this server reports to MCP clients. Max 64 characters.</p>
+                  {#if serverTypeOverridePreviewVisible}
+                    <p class="text-[11px] text-(--fg2) mt-0.5">Will be saved as: <code>{serverTypeOverrideSanitized}</code></p>
+                  {/if}
+                  {#if serverTypeOverrideInvalid}
+                    <p class="text-[11px] text-(--offline) mt-0.5">No usable characters — please include lowercase letters, digits, <code>-</code>, or <code>_</code>.</p>
+                  {/if}
+                  {#if serverTypeOverrideTooLong}
+                    <p class="text-[11px] text-(--offline) mt-0.5">Maximum 64 characters.</p>
+                  {/if}
+                </div>
+              {/if}
             </div>
           </details>
         {/if}
 
-        <!-- Test Connection (not shown for OAuth) -->
-        {#if transport !== 'oauth'}
+        <!-- Test Connection. Suppressed when:
+             - transport is `oauth` (per-server OAuth flow has its own probe), or
+             - `orgBound` is true on any transport (the org-managed EMA path
+               can't be exercised with just transport+url — the access token
+               only exists after add-time, once the org's IdP chain runs).
+             When org-bound, a short note replaces the button so the user
+             understands health is verified after adding. -->
+        {#if transport !== 'oauth' && !orgBound}
           <div class="flex items-center gap-2">
             <button
               type="button"
@@ -1239,6 +1657,10 @@
               {/if}
             {/if}
           </div>
+        {:else if orgBound}
+          <p class="text-[11px] text-(--fg2)">
+            Connection is verified via <strong>{selectedOrganization}</strong>'s shared credentials after you add the server.
+          </p>
         {/if}
 
         {#if error}
@@ -1269,14 +1691,14 @@
           </button>
           <button
             class="px-3 py-1.5 text-sm rounded-lg bg-(--accent) text-white hover:bg-(--accent-hover) transition-colors disabled:opacity-50"
-            onclick={transport === 'oauth' ? handleOAuthSubmit : handleSubmit}
+            onclick={transport === 'oauth' && !orgBound ? handleOAuthSubmit : () => handleSubmit()}
             disabled={submitting}
           >
             {#if submitting}
-              {transport === 'oauth' ? 'Connecting…' : 'Adding…'}
+              {transport === 'oauth' && !orgBound ? 'Connecting…' : 'Adding…'}
             {:else if selectedOAuthEntry}
               Connect with {selectedOAuthEntry.name}
-            {:else if transport === 'oauth'}
+            {:else if transport === 'oauth' && !orgBound}
               Save & Connect
             {:else}
               Add Server
@@ -1288,6 +1710,43 @@
   </div>
 </div>
 
+{#if showOAuthEscalation}
+  <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/40" role="presentation" onclick={dismissOAuthEscalation}>
+    <div
+      class="bg-(--surface) rounded-xl shadow-xl border border-(--border) p-6 w-[28rem] max-w-[90vw]"
+      role="dialog"
+      aria-modal="true"
+      aria-label="This server supports OAuth"
+      tabindex="-1"
+      use:focusTrap={{ onEscape: dismissOAuthEscalation }}
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+    >
+      <h3 class="text-base font-semibold mb-2 text-(--fg1)">This server supports OAuth</h3>
+      <p class="text-sm text-(--fg2) mb-5">
+        <strong>{name.trim() || 'This server'}</strong> advertises OAuth authentication. Set up
+        OAuth now for an authenticated connection, or keep it as a plain unauthenticated endpoint.
+      </p>
+      <div class="flex justify-end gap-2">
+        <button
+          type="button"
+          class="px-3 py-1.5 text-sm rounded-lg border border-(--border) hover:bg-(--surface-hover) transition-colors"
+          onclick={declineOAuthEscalation}
+        >
+          Keep unauthenticated
+        </button>
+        <button
+          type="button"
+          class="px-3 py-1.5 text-sm rounded-lg bg-(--accent) text-white hover:bg-(--accent-hover) transition-colors"
+          onclick={acceptOAuthEscalation}
+        >
+          Set up OAuth
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 {#if showDiscardConfirm}
   <ConfirmModal
     title="Discard changes?"
@@ -1296,6 +1755,10 @@
     onconfirm={() => { showDiscardConfirm = false; void doCancel(); }}
     oncancel={() => { showDiscardConfirm = false; }}
   />
+{/if}
+
+{#if showConnectOrg}
+  <ConnectOrgModal onclose={() => { showConnectOrg = false; }} />
 {/if}
 
 {#if showingDcrFallback}
@@ -1385,4 +1848,38 @@
     </div>
   </div>
 {/if}
+
+<style>
+  /* Toggle pill (36x20) — mirrors the enable/disable switch in DetailPanel */
+  .tgl {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    border-radius: 999px;
+    background: var(--healthy);
+    border: 0;
+    cursor: pointer;
+    padding: 0;
+    flex-shrink: 0;
+    transition: background-color 150ms var(--ease);
+  }
+  .tgl.tgl-off {
+    background: var(--toggle-off);
+  }
+  .tgl > span {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: 999px;
+    background: #fff;
+    box-shadow: 0 1px 2px var(--scrim);
+    transition: transform 150ms var(--ease);
+  }
+  .tgl:not(.tgl-off) > span {
+    transform: translateX(16px);
+  }
+</style>
+
 

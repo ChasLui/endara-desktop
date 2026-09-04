@@ -5,8 +5,14 @@ import {
   shouldShowRestartButton,
   shouldShowRefreshButton,
   shouldShowReauthorizeButton,
+  createReauthGateState,
+  evaluateReauthGate,
+  REAUTH_GATE_GRACE_MS,
   visibleTabs,
+  formatBytes,
+  formatCpuPercent,
   type EndpointTransport,
+  type ReauthGateState,
 } from './detail-panel-helpers';
 
 describe('shouldShowRestartButton', () => {
@@ -241,8 +247,13 @@ describe('DetailPanel endpoint toggle (a11y)', () => {
 });
 
 describe('shouldShowReauthorizeButton', () => {
-  const reauthStatuses: OAuthStatusValue[] = ['disconnected', 'auth_required', 'needs_login'];
-  const nonReauthStatuses: OAuthStatusValue[] = ['authenticated', 'refreshing', 'connection_failed'];
+  const reauthStatuses: OAuthStatusValue[] = [
+    'disconnected',
+    'auth_required',
+    'needs_login',
+    'connection_failed',
+  ];
+  const nonReauthStatuses: OAuthStatusValue[] = ['authenticated', 'refreshing'];
 
   for (const s of reauthStatuses) {
     it(`returns true for oauth + "${s}"`, () => {
@@ -267,6 +278,88 @@ describe('shouldShowReauthorizeButton', () => {
   }
 });
 
+// ── Reauthorize-bar stability gate (anti-flash) ──
+//
+// A freshly-added/restarted OAuth server reports a transient `needs_login`
+// for ~1-2s (one 2s poll) before its just-stored token loads and it flips to
+// `authenticated`. The gate must swallow that single transient yet still
+// surface a genuinely-persistent reauth need within a few seconds.
+describe('evaluateReauthGate', () => {
+  // Simulate consecutive poll cycles 2s apart, returning showBar per poll.
+  function runPolls(needs: boolean[], endpointName = 'srv', startNow = 1000): boolean[] {
+    let state: ReauthGateState = createReauthGateState();
+    const shown: boolean[] = [];
+    needs.forEach((reauthNeeded, i) => {
+      const result = evaluateReauthGate(state, {
+        endpointName,
+        reauthNeeded,
+        now: startNow + i * 2000,
+      });
+      state = result.state;
+      shown.push(result.showBar);
+    });
+    return shown;
+  }
+
+  it('does NOT show the bar on a single transient needs_login', () => {
+    // poll 1: needs_login (transient), poll 2: authenticated.
+    expect(runPolls([true, false])).toEqual([false, false]);
+  });
+
+  it('shows the bar once needs_login persists across >=2 consecutive polls', () => {
+    expect(runPolls([true, true])).toEqual([false, true]);
+  });
+
+  it('never shows the bar while authenticated', () => {
+    expect(runPolls([false, false, false])).toEqual([false, false, false]);
+  });
+
+  it('resets the gate on needs_login -> authenticated -> needs_login (no early flash on the new need)', () => {
+    // First need persists (shows), recovers (reset), then a single new
+    // transient must NOT immediately re-show — the gate restarts clean.
+    expect(runPolls([true, true, false, true])).toEqual([false, true, false, false]);
+  });
+
+  it('shows again after a reset once the new need persists', () => {
+    expect(runPolls([true, true, false, true, true])).toEqual([false, true, false, false, true]);
+  });
+
+  it('shows via the grace window even if only a single (slow) poll has elapsed past it', () => {
+    // One evaluation, but the time gap already exceeds the grace window.
+    const first = evaluateReauthGate(createReauthGateState(), {
+      endpointName: 'srv',
+      reauthNeeded: true,
+      now: 1000,
+    });
+    expect(first.showBar).toBe(false);
+    const later = evaluateReauthGate(first.state, {
+      endpointName: 'srv',
+      reauthNeeded: true,
+      now: 1000 + REAUTH_GATE_GRACE_MS + 1,
+    });
+    expect(later.showBar).toBe(true);
+  });
+
+  it('resets accumulated state when the selected endpoint changes', () => {
+    let result = evaluateReauthGate(createReauthGateState(), {
+      endpointName: 'srv-a',
+      reauthNeeded: true,
+      now: 1000,
+    });
+    expect(result.showBar).toBe(false);
+    // Switching to a different endpoint that also needs reauth must start a
+    // fresh window — not inherit srv-a's count and immediately flash.
+    result = evaluateReauthGate(result.state, {
+      endpointName: 'srv-b',
+      reauthNeeded: true,
+      now: 3000,
+    });
+    expect(result.showBar).toBe(false);
+    expect(result.state.endpointName).toBe('srv-b');
+    expect(result.state.consecutiveCount).toBe(1);
+  });
+});
+
 // ── Re-authorize button source-inspection (mirrors the toggle a11y pattern) ──
 //
 // The Re-authorize button lives inside the red error bar in DetailPanel.svelte
@@ -285,5 +378,112 @@ describe('DetailPanel re-authorize button', () => {
   it('right-aligns the Re-authorize button using ml-auto', () => {
     expect(reauthBlock, 'expected to find the Re-authorize {#if showReauthorize} block').not.toBeNull();
     expect(reauthBlock![0]).toContain('ml-auto');
+  });
+});
+
+// ── Confirm-modal reset on endpoint switch ──
+//
+// A delete/restart confirm opened for one server must never carry over to a
+// different server. DetailPanel guards this two ways: (1) the handlers clear
+// their confirm flag immediately on confirm — before the async mutation — and
+// (2) an effect resets both confirm flags whenever the selected endpoint name
+// changes. Verified via static source inspection (the project has no
+// component-mount test infra; test env is node, not jsdom).
+describe('DetailPanel confirm-modal reset on endpoint switch', () => {
+  const resetEffect = detailPanelSource.match(
+    /\$effect\(\(\) => \{\s*const name = \$selectedEndpoint;[\s\S]*?\}\);/,
+  );
+
+  it('resets both confirm flags in an effect keyed on selectedEndpoint change', () => {
+    expect(resetEffect, 'expected the selectedEndpoint reset effect').not.toBeNull();
+    expect(resetEffect![0]).toContain('name !== prevConfirmEndpoint');
+    expect(resetEffect![0]).toContain('prevConfirmEndpoint = name');
+    expect(resetEffect![0]).toContain('showDeleteConfirm = false');
+    expect(resetEffect![0]).toContain('showRestartConfirm = false');
+  });
+
+  it('tracks the previous endpoint in a plain (non-reactive) variable', () => {
+    expect(detailPanelSource).toMatch(/let prevConfirmEndpoint: string \| null = null;/);
+  });
+
+  it('closes the delete confirm immediately at the start of handleDelete', () => {
+    const handler = detailPanelSource.match(
+      /async function handleDelete\(\) \{[\s\S]*?\n  \}/,
+    );
+    expect(handler, 'expected handleDelete').not.toBeNull();
+    const body = handler![0];
+    // The flag clear must precede the awaited removeEndpoint call.
+    expect(body.indexOf('showDeleteConfirm = false')).toBeLessThan(
+      body.indexOf('await removeEndpoint'),
+    );
+  });
+
+  it('closes the restart confirm immediately at the start of handleRestart', () => {
+    const handler = detailPanelSource.match(
+      /async function handleRestart\(\) \{[\s\S]*?\n  \}/,
+    );
+    expect(handler, 'expected handleRestart').not.toBeNull();
+    const body = handler![0];
+    expect(body.indexOf('showRestartConfirm = false')).toBeLessThan(
+      body.indexOf('await restartEndpoint'),
+    );
+  });
+});
+
+// ── Container-stats formatters (header metrics line) ──
+
+describe('formatBytes', () => {
+  it('formats sub-KB values as whole bytes', () => {
+    expect(formatBytes(0)).toBe('0 B');
+    expect(formatBytes(512)).toBe('512 B');
+    expect(formatBytes(1023)).toBe('1023 B');
+  });
+
+  it('formats KB/MB/GB with one decimal (base 1024)', () => {
+    expect(formatBytes(1024)).toBe('1.0 KB');
+    expect(formatBytes(1536)).toBe('1.5 KB');
+    expect(formatBytes(45.2 * 1024 * 1024)).toBe('45.2 MB');
+    expect(formatBytes(1.2 * 1024 * 1024 * 1024)).toBe('1.2 GB');
+  });
+
+  it('caps at TB for very large values', () => {
+    expect(formatBytes(2.5 * 1024 ** 4)).toBe('2.5 TB');
+    expect(formatBytes(5000 * 1024 ** 4)).toBe('5000.0 TB');
+  });
+
+  it('renders negative and non-finite inputs as 0 B', () => {
+    expect(formatBytes(-1)).toBe('0 B');
+    expect(formatBytes(NaN)).toBe('0 B');
+    expect(formatBytes(Infinity)).toBe('0 B');
+  });
+});
+
+describe('formatCpuPercent', () => {
+  it('formats with one decimal place', () => {
+    expect(formatCpuPercent(0)).toBe('0.0%');
+    expect(formatCpuPercent(1.25)).toBe('1.3%');
+    expect(formatCpuPercent(100)).toBe('100.0%');
+  });
+
+  it('renders negative and non-finite inputs as 0.0%', () => {
+    expect(formatCpuPercent(-3)).toBe('0.0%');
+    expect(formatCpuPercent(NaN)).toBe('0.0%');
+    expect(formatCpuPercent(Infinity)).toBe('0.0%');
+  });
+});
+
+// The metrics line must only render when `container_stats` is present, so
+// direct-spawn endpoints (absent/null stats) show no metrics.
+describe('DetailPanel container-stats line', () => {
+  const statsBlock = detailPanelSource.match(
+    /\{#if ep\.container_stats\}[\s\S]*?\{\/if\}/,
+  );
+
+  it('renders the metrics line under an ep.container_stats guard', () => {
+    expect(statsBlock, 'expected to find the {#if ep.container_stats} block').not.toBeNull();
+    expect(statsBlock![0]).toContain('formatCpuPercent(ep.container_stats.cpu_percent)');
+    expect(statsBlock![0]).toContain('formatBytes(ep.container_stats.mem_bytes)');
+    expect(statsBlock![0]).toContain('formatBytes(ep.container_stats.net_rx_bytes)');
+    expect(statsBlock![0]).toContain('formatBytes(ep.container_stats.net_tx_bytes)');
   });
 });

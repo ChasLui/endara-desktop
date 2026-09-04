@@ -1,5 +1,6 @@
 mod api_proxy;
 mod overlay;
+mod relaunch;
 mod sse;
 mod tray;
 mod webview_recovery;
@@ -32,6 +33,11 @@ const BETA_UPDATE_URL: &str = "https://endara-ai.github.io/endara-desktop/latest
 /// macOS race condition between exit and relaunch described in Tauri issues
 /// #11392 and #1692.
 const RESTART_EXIT_CODE: i32 = 42;
+
+/// Upper bound for the relay `child.kill()` fallback in the `RunEvent::Exit`
+/// arm. The tokio mutex may be held by a task on the still-live app runtime;
+/// an unbounded join there would hang the process before the relaunch.
+const EXIT_TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Timeout for the pre-flight JSON manifest fetch performed before delegating
 /// to `tauri-plugin-updater`. Chosen to be larger than typical CDN latency yet
@@ -457,6 +463,56 @@ fn read_toon_output() -> bool {
         .and_then(|t| t.get("toon_output"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true)
+}
+
+/// Read `relay.write_dirs` from `~/.endara/config.toml`.
+/// Returns an empty list on any error, missing section, or missing key —
+/// matches the relay's own default (no writable directories).
+fn read_write_dirs() -> Vec<String> {
+    let Ok(parsed) = read_config() else {
+        return Vec::new();
+    };
+    // De-duplicate while preserving first-seen order: a hand-edited config
+    // with duplicate entries would otherwise produce duplicate keys in the
+    // UI's keyed `{#each}` list.
+    let mut seen = std::collections::HashSet::new();
+    parsed
+        .get("relay")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("write_dirs"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter(|s| seen.insert(s.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read `relay.listen_ips` from `~/.endara/config.toml`.
+/// Returns an empty list on any error, missing section, or missing key —
+/// matches the relay's own default (loopback-only).
+fn read_listen_ips() -> Vec<String> {
+    let Ok(parsed) = read_config() else {
+        return Vec::new();
+    };
+    // De-duplicate while preserving first-seen order: a hand-edited config
+    // with duplicate entries would otherwise produce duplicate keys in the
+    // UI's keyed `{#each}` list.
+    let mut seen = std::collections::HashSet::new();
+    parsed
+        .get("relay")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("listen_ips"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter(|s| seen.insert(s.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Holds the relay sidecar child process handle.
@@ -1433,6 +1489,8 @@ async fn get_mgmt_api_socket_path() -> Result<String, String> {
 async fn show_overlay(app: AppHandle) -> Result<(), String> {
     if let Some(w) = app.get_webview_window(overlay::OVERLAY_WINDOW_LABEL) {
         w.show().map_err(|e| e.to_string())?;
+        // Bring the macOS click-catcher panel over the now-visible overlay.
+        overlay::sync_click_catcher_frame(&app);
     }
     Ok(())
 }
@@ -1441,16 +1499,23 @@ async fn show_overlay(app: AppHandle) -> Result<(), String> {
 async fn hide_overlay(app: AppHandle) -> Result<(), String> {
     if let Some(w) = app.get_webview_window(overlay::OVERLAY_WINDOW_LABEL) {
         w.hide().map_err(|e| e.to_string())?;
+        // Hide the macOS click-catcher panel alongside the overlay.
+        overlay::sync_click_catcher_frame(&app);
     }
     Ok(())
 }
 
+/// Renderer-reported hit rects for the visible overlay cards (viewport /
+/// logical px). Drives the Rust-side cursor poller that toggles the overlay
+/// window's ignore-cursor-events flag — see `overlay::update_hit_rects` for
+/// why a renderer pointer handler cannot do this (click-through deadlock).
 #[tauri::command]
-async fn set_overlay_ignore_cursor_events(app: AppHandle, ignore: bool) -> Result<(), String> {
-    if let Some(w) = app.get_webview_window(overlay::OVERLAY_WINDOW_LABEL) {
-        w.set_ignore_cursor_events(ignore)
-            .map_err(|e| e.to_string())?;
-    }
+async fn set_overlay_hit_rects(
+    app: AppHandle,
+    state: State<'_, overlay::OverlayHitState>,
+    rects: Vec<overlay::HitRect>,
+) -> Result<(), String> {
+    overlay::update_hit_rects(&app, &state, rects);
     Ok(())
 }
 
@@ -1577,6 +1642,8 @@ async fn apply_overlay_settings(
                 log::warn!("[overlay] destroy on disable failed: {e}");
             }
         }
+        // Tear down the macOS click-catcher panel that mirrored the overlay.
+        overlay::destroy_click_catcher(app);
         log::info!("[overlay] settings update enabled=false applied");
     } else if enabled_changed && new_settings.enabled {
         // Enable: rebuild the overlay window. The renderer auto-invokes
@@ -1636,44 +1703,56 @@ async fn set_overlay_settings(
     apply_overlay_settings(&app, &state, &prev, &new_settings).await
 }
 
-/// Payload emitted to the main window so its RelayLogs view can scroll the
-/// matching `request{id="..."}` row into view. Field name is camelCase to
-/// match the renderer event handler — Tauri serializes Serde structs with
-/// the default rename, and the front-end consumer expects `jsonrpcId`.
+/// Payload emitted to the main window so its Observability view can select +
+/// scroll the matching call row into view. Field name is camelCase to match the
+/// renderer event handler — Tauri serializes Serde structs with the default
+/// rename, and the front-end consumer expects `requestUid`. The id is the
+/// relay-minted `request_uid` the click side resolved.
 #[derive(Serialize, Clone)]
-struct FocusLogPayload {
-    #[serde(rename = "jsonrpcId")]
-    jsonrpc_id: String,
+struct FocusCallPayload {
+    #[serde(rename = "requestUid")]
+    request_uid: String,
 }
 
-/// Show + focus the main window and emit `overlay:focus-log` to it with the
-/// JSON-RPC id of the request the user clicked on in the overlay. The Phase
-/// 4 overlay card click handler is wired through here; Phase 3 ships the
-/// plumbing only.
+/// Show + focus the main window and emit `overlay:focus-call` to it with the
+/// `request_uid` of the call the user clicked on in the overlay. The
+/// Observability tab listens for this and filters its call list to that UUID.
 ///
 /// On macOS we also restore the regular activation policy so the app
 /// reappears in the Dock + Cmd-Tab when the user clicks from an otherwise
 /// hidden / accessory-mode session — mirroring the tray "Open Endara"
 /// behaviour.
 #[tauri::command]
-async fn focus_main_window_on_log(app: AppHandle, jsonrpc_id: String) -> Result<(), String> {
+async fn focus_main_window_on_call(app: AppHandle, request_uid: String) -> Result<(), String> {
+    log::info!(
+        target: "overlay",
+        "focus_main_window_on_call invoked: request_uid={}",
+        request_uid
+    );
+    // `focus_main_window_on_call` is an async command that runs on a tokio
+    // worker thread. `set_macos_activation_policy` asserts it is on the main
+    // thread via `MainThreadMarker::new()`, so dispatch the AppKit work onto
+    // the main thread instead of calling it directly here.
     #[cfg(target_os = "macos")]
-    set_macos_activation_policy(true);
+    app.run_on_main_thread(|| {
+        set_macos_activation_policy(true);
+    })
+    .map_err(|e| e.to_string())?;
     if let Some(window) = app.get_webview_window("main") {
         window.show().map_err(|e| e.to_string())?;
         window.unminimize().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;
         window
             .emit(
-                "overlay:focus-log",
-                FocusLogPayload {
-                    jsonrpc_id: jsonrpc_id.clone(),
+                "overlay:focus-call",
+                FocusCallPayload {
+                    request_uid: request_uid.clone(),
                 },
             )
             .map_err(|e| e.to_string())?;
         log::info!(
-            "[overlay] focus_main_window_on_log emitted jsonrpc_id={}",
-            jsonrpc_id
+            "[overlay] focus_main_window_on_call emitted request_uid={}",
+            request_uid
         );
         Ok(())
     } else {
@@ -1772,6 +1851,155 @@ async fn set_toon_output(enabled: bool) -> Result<(), String> {
         .ok_or("Invalid [relay] section in config")?;
 
     relay.insert("toon_output".to_string(), toml::Value::Boolean(enabled));
+
+    write_config(&table)
+}
+
+/// Get the list of directories sandbox scripts may write into.
+/// Returns an empty list (the relay's own default) if the config is missing,
+/// malformed, has no `[relay]` section, or has no `write_dirs` field.
+#[tauri::command]
+async fn get_write_dirs() -> Result<Vec<String>, String> {
+    Ok(read_write_dirs())
+}
+
+#[tauri::command]
+async fn set_write_dirs(dirs: Vec<String>) -> Result<(), String> {
+    // Fail fast at the Tauri boundary: the native picker only produces
+    // absolute paths, and the relay rejects relative entries on reload —
+    // but never persist an entry the relay would later flag.
+    if let Some(bad) = dirs
+        .iter()
+        .find(|d| d.is_empty() || !std::path::Path::new(d).is_absolute())
+    {
+        return Err(format!(
+            "write_dirs entries must be absolute paths, got: {bad:?}"
+        ));
+    }
+
+    let mut table = read_config().unwrap_or_else(|_| toml::Table::new());
+
+    // Ensure [relay] section exists. The relay's `RelayConfig` requires
+    // `machine_name`, so populate it from the system hostname when creating
+    // the section from scratch — otherwise the relay's next config reload
+    // would fail to deserialize.
+    let relay = table
+        .entry("relay")
+        .or_insert_with(|| {
+            let mut t = toml::Table::new();
+            let machine_name = hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .unwrap_or_else(|| "unknown".to_string());
+            t.insert(
+                "machine_name".to_string(),
+                toml::Value::String(machine_name),
+            );
+            toml::Value::Table(t)
+        })
+        .as_table_mut()
+        .ok_or("Invalid [relay] section in config")?;
+
+    // De-duplicate while preserving first-seen order so repeated picker
+    // selections never produce duplicate entries on disk.
+    let mut seen = std::collections::HashSet::new();
+    let deduped: Vec<toml::Value> = dirs
+        .into_iter()
+        .filter(|d| seen.insert(d.clone()))
+        .map(toml::Value::String)
+        .collect();
+
+    relay.insert("write_dirs".to_string(), toml::Value::Array(deduped));
+
+    write_config(&table)
+}
+
+/// Get the list of extra IPs the relay listens on.
+/// Returns an empty list (the relay's own default, loopback-only) if the
+/// config is missing, malformed, has no `[relay]` section, or has no
+/// `listen_ips` field.
+#[tauri::command]
+async fn get_listen_ips() -> Result<Vec<String>, String> {
+    Ok(read_listen_ips())
+}
+
+/// Mirror of the relay's `listen_ips` eligibility rules
+/// (`endara_relay::listen_ips::classify_listen_ip`): only RFC 1918 private,
+/// CGNAT (100.64.0.0/10), and IPv6 ULA (fc00::/7) addresses are eligible;
+/// an IPv4-mapped IPv6 address classifies as its embedded IPv4. Loopback,
+/// unspecified, link-local, public, and unparseable entries are all
+/// ineligible. The relay's bind-time filter and the UI's render filter
+/// enforce the same invariant; re-checking here keeps the on-disk config
+/// clean even if a future caller bypasses the UI helpers.
+fn eligible_listen_ip(s: &str) -> Option<std::net::IpAddr> {
+    use std::net::IpAddr;
+    fn eligible_v4(ip: std::net::Ipv4Addr) -> bool {
+        let octets = ip.octets();
+        // RFC 1918 or CGNAT 100.64.0.0/10 (RFC 6598).
+        ip.is_private() || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 64)
+    }
+    let ip: IpAddr = s.trim().parse().ok()?;
+    let ok = match ip {
+        IpAddr::V4(v4) => eligible_v4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(mapped) => eligible_v4(mapped),
+            // Unique-local fc00::/7.
+            None => (v6.segments()[0] & 0xfe00) == 0xfc00,
+        },
+    };
+    ok.then_some(ip)
+}
+
+#[tauri::command]
+async fn set_listen_ips(ips: Vec<String>) -> Result<(), String> {
+    let mut table = read_config().unwrap_or_else(|_| toml::Table::new());
+
+    let relay = table
+        .entry("relay")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or("Invalid [relay] section in config")?;
+
+    // The relay's `RelayConfig` requires `machine_name`, so ensure it is
+    // present and non-empty — whether the [relay] section was just created
+    // or already existed without one — otherwise the relay's next config
+    // reload would fail to deserialize.
+    let has_machine_name = relay
+        .get("machine_name")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty());
+    if !has_machine_name {
+        let machine_name = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "unknown".to_string());
+        relay.insert(
+            "machine_name".to_string(),
+            toml::Value::String(machine_name),
+        );
+    }
+
+    // Persist only eligible entries in their canonical textual form
+    // (`IpAddr`'s Display), dropping ineligible or unparseable strings with
+    // a log — defense in depth alongside the relay's bind-time filter. Then
+    // de-duplicate preserving first-seen order so repeated UI selections
+    // never produce duplicate entries on disk. An empty list is written as
+    // `[]`, which the relay treats as loopback-only.
+    let mut seen = std::collections::HashSet::new();
+    let deduped: Vec<toml::Value> = ips
+        .into_iter()
+        .filter_map(|raw| match eligible_listen_ip(&raw) {
+            Some(ip) => Some(ip.to_string()),
+            None => {
+                log::warn!("set_listen_ips: dropping ineligible entry {raw:?}");
+                None
+            }
+        })
+        .filter(|ip| seen.insert(ip.clone()))
+        .map(toml::Value::String)
+        .collect();
+
+    relay.insert("listen_ips".to_string(), toml::Value::Array(deduped));
 
     write_config(&table)
 }
@@ -2001,11 +2229,50 @@ struct EndpointConfig {
     /// or — for legacy entries — in `config.toml`). The secret value itself is
     /// never returned to the UI; the field is masked write-only.
     client_secret_set: bool,
+    /// The EMA **resource** `client_id` stored per-endpoint in the DCR record
+    /// (R3); absent when unset. Not a secret, so the value is returned and the
+    /// Config tab renders it editable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_client_id: Option<String>,
+    /// True iff an EMA **resource** `client_secret` is stored for this endpoint
+    /// (DCR record). The secret value itself is never returned to the UI; the
+    /// field is masked write-only.
+    resource_client_secret_set: bool,
     scopes: Option<String>,
     token_endpoint: Option<String>,
     /// Mirrors `server_type_override` from `config.toml`; absent when no
     /// override is configured for this endpoint.
     server_type_override: Option<String>,
+    /// Mirrors `isolation` from `config.toml` (`"container"` or `"none"`);
+    /// absent for legacy endpoints that never set it (= direct spawn). The
+    /// UI passes it through on update so the relay's PUT — which rebuilds
+    /// the whole endpoint config — doesn't drop the stored value.
+    isolation: Option<String>,
+    /// Mirrors `mounts` from `config.toml` for containerized stdio endpoints
+    /// (verbatim docker `-v` `"host:container"` pairs); absent when none are
+    /// configured. The UI seeds its mount editor from this and passes the
+    /// array back on update so the relay's PUT doesn't drop stored mounts.
+    mounts: Option<Vec<String>>,
+    /// Mirrors the `[endpoints.auth]` sub-table for endpoints bound to an EMA
+    /// organization. Absent for ordinary endpoints — keeps their JSON shape
+    /// unchanged. The UI passes it back on update so the relay's PUT, which
+    /// rebuilds the whole endpoint config from the body, doesn't drop the
+    /// stored org binding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth: Option<EndpointAuth>,
+}
+
+/// EMA org-binding block mirrored back to the UI from `[endpoints.auth]`.
+/// Mirrors the relay's `EmaAuthSummary` shape so the desktop can both display
+/// and round-trip the binding on PUT without translation.
+#[derive(Serialize)]
+struct EndpointAuth {
+    #[serde(rename = "type")]
+    auth_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource: Option<String>,
 }
 
 /// Path to the DCR credentials file for an endpoint, e.g.
@@ -2014,6 +2281,49 @@ struct EndpointConfig {
 /// round-trip.
 fn dcr_file_path(name: &str) -> Result<std::path::PathBuf, String> {
     Ok(data_dir()?.join("tokens").join(format!("{name}.dcr.json")))
+}
+
+/// Credential presence read from an endpoint's `{name}.dcr.json` DCR record.
+/// Mirrors the relay's `DcrCredentials` fields the Config tab needs: whether a
+/// requesting `client_secret` is stored, the (non-secret) EMA
+/// `resource_client_id`, and whether a `resource_client_secret` is stored.
+#[derive(Default)]
+struct DcrCredentialView {
+    client_secret_set: bool,
+    resource_client_id: Option<String>,
+    resource_client_secret_set: bool,
+}
+
+/// Parse a DCR record's JSON into the credential view. A malformed record
+/// degrades gracefully to the all-absent default.
+fn parse_dcr_credential_view(json: &str) -> DcrCredentialView {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return DcrCredentialView::default();
+    };
+    let non_empty = |key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+    };
+    DcrCredentialView {
+        client_secret_set: non_empty("client_secret").is_some(),
+        resource_client_id: non_empty("resource_client_id"),
+        resource_client_secret_set: non_empty("resource_client_secret").is_some(),
+    }
+}
+
+/// Read and parse an endpoint's DCR record. Returns the all-absent default when
+/// no file exists or it can't be read.
+fn read_dcr_credential_view(name: &str) -> DcrCredentialView {
+    let Ok(path) = dcr_file_path(name) else {
+        return DcrCredentialView::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => parse_dcr_credential_view(&contents),
+        Err(_) => DcrCredentialView::default(),
+    }
 }
 
 #[tauri::command]
@@ -2076,8 +2386,13 @@ async fn get_endpoint_config(name: String) -> Result<EndpointConfig, String> {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .filter(|s| !s.is_empty());
-                let dcr_exists = dcr_file_path(&name).map(|p| p.exists()).unwrap_or(false);
-                let client_secret_set = dcr_exists || legacy_toml_secret.is_some();
+                // Read the DCR record's actual contents (not just existence): a
+                // resource-only EMA record (R3) has no requesting `client_secret`,
+                // so file presence alone must not imply one is stored.
+                let dcr_view = read_dcr_credential_view(&name);
+                let client_secret_set = dcr_view.client_secret_set || legacy_toml_secret.is_some();
+                let resource_client_id = dcr_view.resource_client_id;
+                let resource_client_secret_set = dcr_view.resource_client_secret_set;
                 let scopes = ep.get("scopes").and_then(|v| v.as_array()).map(|arr| {
                     arr.iter()
                         .filter_map(|v| v.as_str())
@@ -2093,6 +2408,47 @@ async fn get_endpoint_config(name: String) -> Result<EndpointConfig, String> {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .filter(|s| !s.is_empty());
+                let isolation = ep
+                    .get("isolation")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty());
+                let mounts = ep
+                    .get("mounts")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|m| !m.is_empty());
+                // Surface the `[endpoints.auth]` sub-table for EMA-bound
+                // endpoints so the UI can both display the org and pass the
+                // block back on update (the relay's PUT rebuilds the whole
+                // endpoint config from the body — omitting `auth` would drop
+                // the binding).
+                let auth = ep.get("auth").and_then(|v| v.as_table()).map(|t| {
+                    let auth_type = t
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let organization = t
+                        .get("organization")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.is_empty());
+                    let resource = t
+                        .get("resource")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.is_empty());
+                    EndpointAuth {
+                        auth_type,
+                        organization,
+                        resource,
+                    }
+                });
 
                 return Ok(EndpointConfig {
                     name: name.clone(),
@@ -2107,9 +2463,14 @@ async fn get_endpoint_config(name: String) -> Result<EndpointConfig, String> {
                     oauth_server_url,
                     client_id,
                     client_secret_set,
+                    resource_client_id,
+                    resource_client_secret_set,
                     scopes,
                     token_endpoint,
                     server_type_override,
+                    isolation,
+                    mounts,
+                    auth,
                 });
             }
         }
@@ -2258,8 +2619,22 @@ fn set_tray_health(app: AppHandle, state: &str, detail: Option<String>) {
     }
 }
 
+/// Route panics through the file logger. tao dispatches `LoopDestroyed` outside
+/// its panic guard, so a panic in the `RunEvent::Exit` arm would otherwise only
+/// reach stderr and leave no trace in `Endara Desktop.log`.
+fn install_panic_log_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("panic: {info}");
+        log::logger().flush();
+        default_hook(info);
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_panic_log_hook();
+
     // Capture `config.toml` existence BEFORE any code path (read_config,
     // read_port_from_config, the relay sidecar spawn) has had a chance to
     // touch the file. The overlay migration helper in Phase 5 uses this to
@@ -2304,6 +2679,9 @@ pub fn run() {
     let channel = read_update_channel();
     let autostarted = is_autostarted();
     let dev = is_dev_mode();
+    let relaunched_from =
+        relaunch::relaunched_from(std::env::args_os().map(|a| a.to_string_lossy().into_owned()));
+    let exit_version = version.clone();
 
     // Set to `true` by the `RunEvent::ExitRequested` arm when the app is asked to
     // exit with `RESTART_EXIT_CODE` (via the `restart_after_update` command); the
@@ -2341,6 +2719,7 @@ pub fn run() {
         .manage(pending_update)
         .manage(UpdaterBackoffState::default())
         .manage(overlay::OverlaySubscriberState::default())
+        .manage(overlay::OverlayHitState::default())
         .invoke_handler(tauri::generate_handler![
             start_relay,
             stop_relay,
@@ -2358,6 +2737,10 @@ pub fn run() {
             set_js_execution_mode,
             get_toon_output,
             set_toon_output,
+            get_write_dirs,
+            set_write_dirs,
+            get_listen_ips,
+            set_listen_ips,
             get_config_path_display,
             get_buffered_relay_logs,
             get_update_channel,
@@ -2371,22 +2754,23 @@ pub fn run() {
             set_tray_health,
             show_overlay,
             hide_overlay,
-            set_overlay_ignore_cursor_events,
+            set_overlay_hit_rects,
             reposition_overlay,
             subscribe_tool_call_events,
             unsubscribe_tool_call_events,
             get_overlay_settings,
             set_overlay_settings,
-            focus_main_window_on_log,
+            focus_main_window_on_call,
         ])
         .setup(move |app| {
             log::info!(
-                "desktop starting version={} commit={} channel={} autostarted={} is_dev={}",
+                "desktop starting version={} commit={} channel={} autostarted={} is_dev={} relaunched_from={}",
                 version,
                 commit,
                 channel,
                 autostarted,
-                dev
+                dev,
+                relaunched_from.as_deref().unwrap_or("none")
             );
 
             // Resolve the overlay's persisted settings BEFORE building the
@@ -2664,9 +3048,19 @@ pub fn run() {
                 if code == Some(RESTART_EXIT_CODE) {
                     restart_requested = true;
                 }
+                log::info!(
+                    "app exit requested code={:?} restart_requested={}",
+                    code,
+                    restart_requested
+                );
             }
             RunEvent::Exit => {
-                log::info!("app exit");
+                log::info!("app exit restart_requested={}", restart_requested);
+                // Release the macOS click-catcher panel while still on the main
+                // thread (the event loop has stopped, so a dispatched teardown
+                // would never run).
+                overlay::destroy_click_catcher(app);
+                log::info!("[exit] click-catcher released");
                 // Suppress any in-flight supervisor logic so the upcoming SIGTERM
                 // is treated as an intentional shutdown, then abort a pending
                 // auto-restart task if one is sleeping out its backoff window.
@@ -2693,10 +3087,16 @@ pub fn run() {
                         }
                     }
                 }
+                log::info!("[exit] relay SIGTERM step done");
                 // Also try the async child.kill() as fallback, in a separate thread
-                // to avoid deadlocking on the tokio runtime during shutdown.
+                // to avoid deadlocking on the tokio runtime during shutdown. The
+                // wait is bounded: if the tokio mutex is held elsewhere we move on
+                // rather than hang here. Process exit does NOT reap the sidecar;
+                // the SIGTERM above is the real kill, and a sidecar that survives
+                // it shows up as a pre-flight port conflict on the next launch.
                 let child_handle = child_handle.clone();
-                let _ = std::thread::spawn(move || {
+                let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+                std::thread::spawn(move || {
                     if let Ok(rt) = tokio::runtime::Runtime::new() {
                         rt.block_on(async {
                             let mut guard = child_handle.lock().await;
@@ -2705,20 +3105,83 @@ pub fn run() {
                             }
                         });
                     }
-                })
-                .join();
+                    let _ = done_tx.send(());
+                });
+                match done_rx.recv_timeout(EXIT_TEARDOWN_TIMEOUT) {
+                    Ok(()) => log::info!("[exit] relay child.kill step done"),
+                    Err(e) => log::warn!(
+                        "[exit] relay child.kill step did not finish within {:?} ({e}); continuing",
+                        EXIT_TEARDOWN_TIMEOUT
+                    ),
+                }
                 // If this exit was a restart request, relaunch now that the event
                 // loop has stopped and the relay sidecar has been torn down. Doing
                 // it here (rather than at request time) is the macOS-safe workaround
-                // for the exit/relaunch race in Tauri issues #11392 and #1692.
+                // for the exit/relaunch race in Tauri issues #11392 and #1692. The
+                // spawn is owned by `relaunch` (not `tauri::process::restart`) so
+                // the strategy, argv and result are all logged, and so macOS goes
+                // through a detached helper + LaunchServices instead of exec'ing
+                // the just-swapped binary from the dying parent.
                 if restart_requested {
-                    log::info!("restarting app after update");
-                    app.cleanup_before_exit();
-                    tauri::process::restart(&app.env());
+                    log::info!("restarting app after update version={}", exit_version);
+                    let cleanup =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            app.cleanup_before_exit()
+                        }));
+                    match cleanup {
+                        Ok(()) => log::info!("[exit] cleanup_before_exit done"),
+                        Err(_) => log::error!("[exit] cleanup_before_exit panicked; continuing"),
+                    }
+                    let spawned = relaunch::spawn(&app.env(), &exit_version);
+                    log::info!("[exit] relaunch spawned={spawned}; exiting parent");
+                    log::logger().flush();
+                    std::process::exit(0);
                 }
             }
             _ => {}
         });
+}
+
+#[cfg(test)]
+mod dcr_credential_view_tests {
+    use super::*;
+
+    #[test]
+    fn parses_requesting_and_resource_creds() {
+        let json = r#"{"client_id":"req","client_secret":"sec","resource_client_id":"res","resource_client_secret":"res-sec"}"#;
+        let view = parse_dcr_credential_view(json);
+        assert!(view.client_secret_set);
+        assert_eq!(view.resource_client_id.as_deref(), Some("res"));
+        assert!(view.resource_client_secret_set);
+    }
+
+    #[test]
+    fn resource_only_record_does_not_imply_a_client_secret() {
+        // R3: a per-endpoint EMA record may carry only the resource pair with an
+        // empty requesting client_id and no requesting secret.
+        let json = r#"{"client_id":"","resource_client_id":"res"}"#;
+        let view = parse_dcr_credential_view(json);
+        assert!(!view.client_secret_set);
+        assert_eq!(view.resource_client_id.as_deref(), Some("res"));
+        assert!(!view.resource_client_secret_set);
+    }
+
+    #[test]
+    fn empty_strings_count_as_absent() {
+        let json = r#"{"client_secret":"","resource_client_id":"","resource_client_secret":""}"#;
+        let view = parse_dcr_credential_view(json);
+        assert!(!view.client_secret_set);
+        assert!(view.resource_client_id.is_none());
+        assert!(!view.resource_client_secret_set);
+    }
+
+    #[test]
+    fn malformed_json_degrades_to_default() {
+        let view = parse_dcr_credential_view("not json");
+        assert!(!view.client_secret_set);
+        assert!(view.resource_client_id.is_none());
+        assert!(!view.resource_client_secret_set);
+    }
 }
 
 #[cfg(test)]
@@ -3604,6 +4067,531 @@ mod toon_output_tests {
             .expect("args preserved");
         assert_eq!(args.len(), 1);
         assert_eq!(args[0].as_str(), Some("hi"));
+    }
+}
+
+#[cfg(test)]
+mod write_dirs_tests {
+    //! Round-trip coverage for `read_write_dirs` / `set_write_dirs` and the
+    //! structurally identical `read_listen_ips` / `set_listen_ips`.
+    //! Mirrors `toon_output_tests` but pins the default to an empty list —
+    //! a missing field, missing section, missing file, or malformed file all
+    //! resolve to no writable directories (or no extra listen IPs).
+    use super::*;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    struct HomeGuard {
+        prior: Option<String>,
+        _tmp: TempDir,
+    }
+
+    impl HomeGuard {
+        fn new() -> Self {
+            let prior = std::env::var("HOME").ok();
+            let tmp = tempfile::tempdir().expect("create tempdir");
+            std::env::set_var("HOME", tmp.path());
+            Self { prior, _tmp: tmp }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime")
+    }
+
+    fn write_config_str(contents: &str) {
+        let path = config_path().expect("config_path");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dir");
+        }
+        std::fs::write(&path, contents).expect("write config.toml");
+    }
+
+    fn read_config_str() -> String {
+        let path = config_path().expect("config_path");
+        std::fs::read_to_string(&path).expect("read config.toml")
+    }
+
+    #[test]
+    #[serial]
+    fn get_write_dirs_returns_entries_when_set() {
+        let _home = HomeGuard::new();
+        write_config_str("[relay]\nmachine_name = \"x\"\nwrite_dirs = [\"/tmp/a\", \"/tmp/b\"]\n");
+        assert_eq!(read_write_dirs(), vec!["/tmp/a", "/tmp/b"]);
+    }
+
+    #[test]
+    #[serial]
+    fn get_write_dirs_returns_empty_when_field_missing() {
+        let _home = HomeGuard::new();
+        write_config_str("[relay]\nmachine_name = \"x\"\n");
+        assert!(read_write_dirs().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn get_write_dirs_returns_empty_when_no_relay_section() {
+        let _home = HomeGuard::new();
+        write_config_str("[desktop]\nupdate_channel = \"stable\"\n");
+        assert!(read_write_dirs().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn get_write_dirs_returns_empty_when_file_missing() {
+        let _home = HomeGuard::new();
+        // No config.toml written.
+        assert!(read_write_dirs().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn get_write_dirs_returns_empty_when_file_malformed() {
+        let _home = HomeGuard::new();
+        write_config_str("not valid toml ====\n");
+        assert!(read_write_dirs().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn set_write_dirs_roundtrips() {
+        let _home = HomeGuard::new();
+        let rt = rt();
+        write_config_str("[relay]\nmachine_name = \"x\"\n");
+
+        rt.block_on(set_write_dirs(vec![
+            "/tmp/a".to_string(),
+            "/tmp/b".to_string(),
+        ]))
+        .expect("set write_dirs");
+        assert_eq!(read_write_dirs(), vec!["/tmp/a", "/tmp/b"]);
+
+        rt.block_on(set_write_dirs(vec![]))
+            .expect("clear write_dirs");
+        assert!(read_write_dirs().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn get_write_dirs_deduplicates_preserving_order() {
+        let _home = HomeGuard::new();
+        write_config_str(
+            "[relay]\nmachine_name = \"x\"\nwrite_dirs = [\"/tmp/a\", \"/tmp/b\", \"/tmp/a\"]\n",
+        );
+        assert_eq!(read_write_dirs(), vec!["/tmp/a", "/tmp/b"]);
+    }
+
+    #[test]
+    #[serial]
+    fn set_write_dirs_rejects_relative_and_empty_paths() {
+        let _home = HomeGuard::new();
+        let rt = rt();
+        write_config_str("[relay]\nmachine_name = \"x\"\n");
+
+        for bad in ["relative/path", "", "./dot"] {
+            let err = rt
+                .block_on(set_write_dirs(vec!["/tmp/a".to_string(), bad.to_string()]))
+                .expect_err("non-absolute entry should be rejected");
+            assert!(err.contains("absolute"), "unexpected error: {err}");
+        }
+        // Nothing was persisted by the rejected calls.
+        assert!(read_write_dirs().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn set_write_dirs_deduplicates_preserving_order() {
+        let _home = HomeGuard::new();
+        let rt = rt();
+        write_config_str("[relay]\nmachine_name = \"x\"\n");
+
+        rt.block_on(set_write_dirs(vec![
+            "/tmp/a".to_string(),
+            "/tmp/b".to_string(),
+            "/tmp/a".to_string(),
+        ]))
+        .expect("set write_dirs");
+
+        assert_eq!(read_write_dirs(), vec!["/tmp/a", "/tmp/b"]);
+    }
+
+    #[test]
+    #[serial]
+    fn set_write_dirs_creates_missing_relay_section() {
+        let _home = HomeGuard::new();
+        let rt = rt();
+        write_config_str("[desktop]\nupdate_channel = \"stable\"\n");
+
+        rt.block_on(set_write_dirs(vec!["/tmp/a".to_string()]))
+            .expect("set_write_dirs should succeed");
+
+        let toml_str = read_config_str();
+        let parsed: toml::Table =
+            toml::from_str(&toml_str).expect("re-parse config.toml as toml::Table");
+
+        let relay = parsed
+            .get("relay")
+            .and_then(|v| v.as_table())
+            .expect("[relay] section should exist");
+        let dirs = relay
+            .get("write_dirs")
+            .and_then(|v| v.as_array())
+            .expect("write_dirs should be set");
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].as_str(), Some("/tmp/a"));
+        let machine_name = relay
+            .get("machine_name")
+            .and_then(|v| v.as_str())
+            .expect("machine_name should be set");
+        assert!(
+            !machine_name.is_empty(),
+            "machine_name should be non-empty, got {machine_name:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn set_write_dirs_preserves_other_fields() {
+        let _home = HomeGuard::new();
+        let rt = rt();
+        write_config_str(
+            "[desktop]\n\
+             update_channel = \"beta\"\n\
+             \n\
+             [relay]\n\
+             machine_name = \"host\"\n\
+             token_dir = \"/tmp/x\"\n\
+             local_js_execution = true\n\
+             toon_output = false\n\
+             \n\
+             [[endpoints]]\n\
+             name = \"gmail-acct\"\n\
+             transport = \"stdio\"\n\
+             tool_prefix = \"gmail\"\n\
+             command = \"echo\"\n\
+             args = [\"hi\"]\n",
+        );
+
+        rt.block_on(set_write_dirs(vec!["/tmp/allowed".to_string()]))
+            .expect("set_write_dirs should succeed");
+
+        let toml_str = read_config_str();
+        let parsed: toml::Table =
+            toml::from_str(&toml_str).expect("re-parse config.toml as toml::Table");
+
+        let desktop = parsed
+            .get("desktop")
+            .and_then(|v| v.as_table())
+            .expect("[desktop] preserved");
+        assert_eq!(
+            desktop.get("update_channel").and_then(|v| v.as_str()),
+            Some("beta"),
+            "update_channel should be preserved"
+        );
+
+        let relay = parsed
+            .get("relay")
+            .and_then(|v| v.as_table())
+            .expect("[relay] preserved");
+        assert_eq!(
+            relay.get("machine_name").and_then(|v| v.as_str()),
+            Some("host"),
+            "machine_name should be preserved"
+        );
+        assert_eq!(
+            relay.get("token_dir").and_then(|v| v.as_str()),
+            Some("/tmp/x"),
+            "token_dir should be preserved"
+        );
+        assert_eq!(
+            relay.get("local_js_execution").and_then(|v| v.as_bool()),
+            Some(true),
+            "local_js_execution should be preserved"
+        );
+        assert_eq!(
+            relay.get("toon_output").and_then(|v| v.as_bool()),
+            Some(false),
+            "toon_output should be preserved"
+        );
+        let dirs = relay
+            .get("write_dirs")
+            .and_then(|v| v.as_array())
+            .expect("write_dirs should be set");
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].as_str(), Some("/tmp/allowed"));
+
+        let endpoints = parsed
+            .get("endpoints")
+            .and_then(|v| v.as_array())
+            .expect("[[endpoints]] preserved");
+        assert_eq!(endpoints.len(), 1, "endpoint count should be unchanged");
+        let ep = endpoints[0].as_table().expect("endpoint is a table");
+        assert_eq!(ep.get("name").and_then(|v| v.as_str()), Some("gmail-acct"));
+        assert_eq!(ep.get("transport").and_then(|v| v.as_str()), Some("stdio"));
+        assert_eq!(
+            ep.get("tool_prefix").and_then(|v| v.as_str()),
+            Some("gmail")
+        );
+        assert_eq!(ep.get("command").and_then(|v| v.as_str()), Some("echo"));
+        let args = ep
+            .get("args")
+            .and_then(|v| v.as_array())
+            .expect("args preserved");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].as_str(), Some("hi"));
+    }
+
+    #[test]
+    #[serial]
+    fn get_listen_ips_returns_entries_when_set() {
+        let _home = HomeGuard::new();
+        write_config_str(
+            "[relay]\nmachine_name = \"x\"\nlisten_ips = [\"192.168.1.5\", \"10.0.0.2\"]\n",
+        );
+        assert_eq!(read_listen_ips(), vec!["192.168.1.5", "10.0.0.2"]);
+    }
+
+    #[test]
+    #[serial]
+    fn get_listen_ips_returns_empty_when_field_missing() {
+        let _home = HomeGuard::new();
+        write_config_str("[relay]\nmachine_name = \"x\"\n");
+        assert!(read_listen_ips().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn get_listen_ips_returns_empty_when_no_relay_section() {
+        let _home = HomeGuard::new();
+        write_config_str("[desktop]\nupdate_channel = \"stable\"\n");
+        assert!(read_listen_ips().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn get_listen_ips_returns_empty_when_file_missing() {
+        let _home = HomeGuard::new();
+        // No config.toml written.
+        assert!(read_listen_ips().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn get_listen_ips_returns_empty_when_file_malformed() {
+        let _home = HomeGuard::new();
+        write_config_str("not valid toml ====\n");
+        assert!(read_listen_ips().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn get_listen_ips_deduplicates_preserving_order() {
+        let _home = HomeGuard::new();
+        write_config_str(
+            "[relay]\nmachine_name = \"x\"\nlisten_ips = [\"10.0.0.1\", \"10.0.0.2\", \"10.0.0.1\"]\n",
+        );
+        assert_eq!(read_listen_ips(), vec!["10.0.0.1", "10.0.0.2"]);
+    }
+
+    #[test]
+    #[serial]
+    fn set_listen_ips_roundtrips() {
+        let _home = HomeGuard::new();
+        let rt = rt();
+        write_config_str("[relay]\nmachine_name = \"x\"\n");
+
+        rt.block_on(set_listen_ips(vec![
+            "192.168.1.5".to_string(),
+            "10.0.0.2".to_string(),
+        ]))
+        .expect("set listen_ips");
+        assert_eq!(read_listen_ips(), vec!["192.168.1.5", "10.0.0.2"]);
+
+        rt.block_on(set_listen_ips(vec![]))
+            .expect("clear listen_ips");
+        assert!(read_listen_ips().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn set_listen_ips_deduplicates_preserving_order() {
+        let _home = HomeGuard::new();
+        let rt = rt();
+        write_config_str("[relay]\nmachine_name = \"x\"\n");
+
+        rt.block_on(set_listen_ips(vec![
+            "10.0.0.1".to_string(),
+            "10.0.0.2".to_string(),
+            "10.0.0.1".to_string(),
+        ]))
+        .expect("set listen_ips");
+
+        assert_eq!(read_listen_ips(), vec!["10.0.0.1", "10.0.0.2"]);
+    }
+
+    #[test]
+    #[serial]
+    fn set_listen_ips_creates_missing_relay_section() {
+        let _home = HomeGuard::new();
+        let rt = rt();
+        write_config_str("[desktop]\nupdate_channel = \"stable\"\n");
+
+        rt.block_on(set_listen_ips(vec!["192.168.1.5".to_string()]))
+            .expect("set_listen_ips should succeed");
+
+        let toml_str = read_config_str();
+        let parsed: toml::Table =
+            toml::from_str(&toml_str).expect("re-parse config.toml as toml::Table");
+
+        let relay = parsed
+            .get("relay")
+            .and_then(|v| v.as_table())
+            .expect("[relay] section should exist");
+        let ips = relay
+            .get("listen_ips")
+            .and_then(|v| v.as_array())
+            .expect("listen_ips should be set");
+        assert_eq!(ips.len(), 1);
+        assert_eq!(ips[0].as_str(), Some("192.168.1.5"));
+        let machine_name = relay
+            .get("machine_name")
+            .and_then(|v| v.as_str())
+            .expect("machine_name should be set");
+        assert!(
+            !machine_name.is_empty(),
+            "machine_name should be non-empty, got {machine_name:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn set_listen_ips_empty_list_writes_empty_array() {
+        let _home = HomeGuard::new();
+        let rt = rt();
+        write_config_str("[relay]\nmachine_name = \"x\"\nlisten_ips = [\"10.0.0.1\"]\n");
+
+        rt.block_on(set_listen_ips(vec![]))
+            .expect("clear listen_ips");
+
+        let toml_str = read_config_str();
+        let parsed: toml::Table =
+            toml::from_str(&toml_str).expect("re-parse config.toml as toml::Table");
+        let ips = parsed
+            .get("relay")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("listen_ips"))
+            .and_then(|v| v.as_array())
+            .expect("listen_ips should be an empty array");
+        assert!(ips.is_empty(), "empty list should persist as []");
+    }
+
+    #[test]
+    #[serial]
+    fn set_listen_ips_drops_ineligible_entries() {
+        let _home = HomeGuard::new();
+        let rt = rt();
+        write_config_str("[relay]\nmachine_name = \"x\"\n");
+
+        rt.block_on(set_listen_ips(vec![
+            "192.168.1.5".to_string(),
+            "0.0.0.0".to_string(),
+            "127.0.0.1".to_string(),
+            "8.8.8.8".to_string(),
+            "::".to_string(),
+            "fe80::1".to_string(),
+            "2001:db8::1".to_string(),
+            "not-an-ip".to_string(),
+            "fd00::1".to_string(),
+            "100.101.102.103".to_string(),
+        ]))
+        .expect("set listen_ips");
+
+        assert_eq!(
+            read_listen_ips(),
+            vec!["192.168.1.5", "fd00::1", "100.101.102.103"],
+            "only RFC 1918 / CGNAT / ULA entries should be persisted"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn set_listen_ips_canonicalizes_entries() {
+        let _home = HomeGuard::new();
+        let rt = rt();
+        write_config_str("[relay]\nmachine_name = \"x\"\n");
+
+        rt.block_on(set_listen_ips(vec![
+            " 10.0.0.7 ".to_string(),
+            "fd00:0:0:0:0:0:0:1".to_string(),
+            "FD00:0::1".to_string(),
+            "fd00::1".to_string(),
+        ]))
+        .expect("set listen_ips");
+
+        assert_eq!(
+            read_listen_ips(),
+            vec!["10.0.0.7", "fd00::1"],
+            "entries should be trimmed, canonicalized, and deduped by address"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn set_listen_ips_ensures_machine_name_in_existing_relay_section() {
+        let _home = HomeGuard::new();
+        let rt = rt();
+        write_config_str("[relay]\nlisten_ips = []\n");
+
+        rt.block_on(set_listen_ips(vec!["192.168.1.5".to_string()]))
+            .expect("set listen_ips");
+
+        let parsed: toml::Table =
+            toml::from_str(&read_config_str()).expect("re-parse config.toml as toml::Table");
+        let machine_name = parsed
+            .get("relay")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("machine_name"))
+            .and_then(|v| v.as_str())
+            .expect("machine_name should be inserted into the existing [relay] section");
+        assert!(
+            !machine_name.trim().is_empty(),
+            "machine_name should be non-empty, got {machine_name:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn set_listen_ips_preserves_existing_machine_name() {
+        let _home = HomeGuard::new();
+        let rt = rt();
+        write_config_str("[relay]\nmachine_name = \"my-box\"\n");
+
+        rt.block_on(set_listen_ips(vec!["192.168.1.5".to_string()]))
+            .expect("set listen_ips");
+
+        let parsed: toml::Table =
+            toml::from_str(&read_config_str()).expect("re-parse config.toml as toml::Table");
+        assert_eq!(
+            parsed
+                .get("relay")
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get("machine_name"))
+                .and_then(|v| v.as_str()),
+            Some("my-box"),
+            "an existing machine_name must not be overwritten"
+        );
     }
 }
 

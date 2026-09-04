@@ -21,6 +21,8 @@ import {
   buildMountExample,
   buildOrgBoundEndpointParams,
   orgBindingApplies,
+  buildCatalogEnvAndHeaders,
+  mergeHeaders,
   MOUNT_EXAMPLE_FALLBACK_HOST,
   type AddEndpointFieldErrors,
   type AddEndpointFormSnapshot,
@@ -750,10 +752,12 @@ describe('computeAddEndpointIsDirty', () => {
   });
 
   it('returns false against a catalog-prefilled baseline that is unchanged', () => {
+    // Mirrors the http GitHub catalog entry: URL prefilled, no command/args.
     const snap = makeSnapshot({
       name: 'GitHub',
-      command: 'npx',
-      args: '-y @modelcontextprotocol/server-github',
+      command: '',
+      args: '',
+      url: 'https://api.githubcopilot.com/mcp/',
       description: 'Code hosting and collaboration',
     });
     expect(computeAddEndpointIsDirty(snap, { ...snap })).toBe(false);
@@ -1020,6 +1024,233 @@ describe('catalog containerizable flags', () => {
         expect(s.containerNote!.trim().length).toBeGreaterThan(0);
       }
     }
+  });
+});
+
+describe('buildCatalogEnvAndHeaders', () => {
+  const plainVar = { name: 'API_KEY', label: 'API Key', required: true, secret: true };
+  const headerVar = {
+    name: 'PAT',
+    label: 'Personal Access Token',
+    required: true,
+    secret: true,
+    header: { name: 'Authorization', valuePrefix: 'Bearer ' },
+  };
+
+  it('routes a header-typed var to headers with its prefix', () => {
+    const out = buildCatalogEnvAndHeaders({ envVars: [headerVar] }, { PAT: 'ghp_abc' });
+    expect(out.headers).toEqual({ Authorization: 'Bearer ghp_abc' });
+    expect(out.env).toEqual({});
+  });
+
+  it('routes a plain var to env', () => {
+    const out = buildCatalogEnvAndHeaders({ envVars: [plainVar] }, { API_KEY: 'k123' });
+    expect(out.env).toEqual({ API_KEY: 'k123' });
+    expect(out.headers).toEqual({});
+  });
+
+  it('trims values and skips empty ones', () => {
+    const out = buildCatalogEnvAndHeaders(
+      { envVars: [plainVar, headerVar] },
+      { API_KEY: '  k123  ', PAT: '   ' },
+    );
+    expect(out.env).toEqual({ API_KEY: 'k123' });
+    expect(out.headers).toEqual({});
+  });
+
+  it('skips vars with no entered value', () => {
+    const out = buildCatalogEnvAndHeaders({ envVars: [plainVar, headerVar] }, {});
+    expect(out).toEqual({ env: {}, headers: {} });
+  });
+
+  it('trims the header name and skips blank header names', () => {
+    const padded = buildCatalogEnvAndHeaders(
+      { envVars: [{ ...headerVar, header: { name: '  X-Api-Key  ' } }] },
+      { PAT: 'raw' },
+    );
+    expect(padded.headers).toEqual({ 'X-Api-Key': 'raw' });
+
+    const blank = buildCatalogEnvAndHeaders(
+      { envVars: [{ ...headerVar, header: { name: '   ' } }] },
+      { PAT: 'raw' },
+    );
+    expect(blank).toEqual({ env: {}, headers: {} });
+  });
+
+  it('uses an empty prefix when valuePrefix is absent', () => {
+    const out = buildCatalogEnvAndHeaders(
+      { envVars: [{ ...headerVar, header: { name: 'X-Api-Key' } }] },
+      { PAT: 'raw' },
+    );
+    expect(out.headers).toEqual({ 'X-Api-Key': 'raw' });
+  });
+
+  it('splits a mixed set into env and headers', () => {
+    const out = buildCatalogEnvAndHeaders(
+      { envVars: [plainVar, headerVar] },
+      { API_KEY: 'k123', PAT: 'ghp_abc' },
+    );
+    expect(out).toEqual({
+      env: { API_KEY: 'k123' },
+      headers: { Authorization: 'Bearer ghp_abc' },
+    });
+  });
+
+  it('maps the catalog GitHub entry PAT to an Authorization bearer header', () => {
+    const github = CATALOG_SERVERS.find((s) => s.id === 'github')!;
+    const out = buildCatalogEnvAndHeaders(github, { [github.envVars[0].name]: 'ghp_xyz' });
+    expect(out).toEqual({ env: {}, headers: { Authorization: 'Bearer ghp_xyz' } });
+  });
+
+  it('produces no GITHUB_PERSONAL_ACCESS_TOKEN env var for the GitHub entry', () => {
+    const github = CATALOG_SERVERS.find((s) => s.id === 'github')!;
+    const out = buildCatalogEnvAndHeaders(github, { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_xyz' });
+    expect(out.env).not.toHaveProperty('GITHUB_PERSONAL_ACCESS_TOKEN');
+    expect(out.headers.Authorization).toBe('Bearer ghp_xyz');
+  });
+});
+
+describe('mergeHeaders', () => {
+  const seeded = { Authorization: 'Bearer ghp_abc' };
+
+  it('returns the seeded headers unchanged when there are no custom rows', () => {
+    expect(mergeHeaders(seeded, [])).toEqual(seeded);
+  });
+
+  it('adds custom rows that do not collide with seeded keys', () => {
+    expect(mergeHeaders(seeded, [{ key: 'X-Trace', value: '1' }])).toEqual({
+      Authorization: 'Bearer ghp_abc',
+      'X-Trace': '1',
+    });
+  });
+
+  it('lets a custom row override a seeded key with the same case', () => {
+    expect(mergeHeaders(seeded, [{ key: 'Authorization', value: 'token x' }])).toEqual({
+      Authorization: 'token x',
+    });
+  });
+
+  it('lets a custom row override a seeded key case-insensitively without leaving two keys', () => {
+    const out = mergeHeaders(seeded, [{ key: 'authorization', value: 'token x' }]);
+    expect(out).toEqual({ authorization: 'token x' });
+    expect(Object.keys(out)).toHaveLength(1);
+  });
+
+  it('trims custom keys and skips blank ones', () => {
+    expect(
+      mergeHeaders(seeded, [
+        { key: '  X-Trace  ', value: '1' },
+        { key: '   ', value: 'ignored' },
+      ]),
+    ).toEqual({ Authorization: 'Bearer ghp_abc', 'X-Trace': '1' });
+  });
+
+  it('applies later custom rows over earlier ones, case-insensitively', () => {
+    expect(
+      mergeHeaders({}, [
+        { key: 'X-Api-Key', value: 'a' },
+        { key: 'x-api-key', value: 'b' },
+      ]),
+    ).toEqual({ 'x-api-key': 'b' });
+  });
+
+  it('does not mutate the seeded map', () => {
+    const base = { Authorization: 'Bearer ghp_abc' };
+    mergeHeaders(base, [{ key: 'authorization', value: 'x' }]);
+    expect(base).toEqual({ Authorization: 'Bearer ghp_abc' });
+  });
+
+  it('stores prototype-named keys as plain entries without polluting the prototype', () => {
+    const out = mergeHeaders(seeded, [
+      { key: '__proto__', value: 'x' },
+      { key: 'constructor', value: 'y' },
+    ]);
+    expect(Object.getPrototypeOf(out)).toBeNull();
+    expect(Object.keys(out).sort()).toEqual(['Authorization', '__proto__', 'constructor']);
+    expect(out['__proto__']).toBe('x');
+    expect(out['constructor']).toBe('y');
+    expect(({} as Record<string, unknown>)['x']).toBeUndefined();
+    expect(Object.keys(JSON.parse(JSON.stringify(out))).sort()).toEqual([
+      'Authorization',
+      '__proto__',
+      'constructor',
+    ]);
+  });
+});
+
+// The modal builds its env/headers from `buildCatalogEnvAndHeaders` in both
+// the Test Connection (`buildConnectionParams`) and Add (`handleSubmit`)
+// paths, so header-typed catalog vars (GitHub PAT) reach `params.headers`.
+// Test environment is node (not jsdom), so the assertions are on the Svelte
+// source — mirrors the static-source style used elsewhere in this suite.
+describe('AddEndpointModal — catalog env/header wiring', () => {
+  it('prefills the URL from the catalog entry in selectCatalog', () => {
+    const selectCatalogBlock = addEndpointModalSource.match(
+      /function selectCatalog\(server: CatalogServer\) \{[\s\S]*?step = 'configure';/,
+    );
+    expect(selectCatalogBlock, 'expected the selectCatalog body').not.toBeNull();
+    expect(selectCatalogBlock![0]).toMatch(/url = server\.url \?\? '';/);
+    expect(selectCatalogBlock![0]).toMatch(/command = server\.command \?\? '';/);
+    expect(selectCatalogBlock![0]).toMatch(/args = \(server\.args \?\? \[\]\)\.join\(' '\);/);
+  });
+
+  it('routes catalog values through buildCatalogEnvAndHeaders in both Test Connection and Add', () => {
+    const calls = addEndpointModalSource.match(
+      /buildCatalogEnvAndHeaders\(selectedCatalog, catalogEnvValues\)/g,
+    ) ?? [];
+    expect(calls.length).toBe(2);
+    // No inline catalog env loop remains — the helper is the single source of truth.
+    expect(addEndpointModalSource).not.toMatch(/for \(const ev of selectedCatalog\.envVars\)/);
+  });
+
+  it('seeds env and headers from the helper output, with custom rows applied afterwards', () => {
+    // Catalog-derived values seed the maps; the user's custom env rows are
+    // spread in afterwards, and custom header rows go through `mergeHeaders`
+    // so a custom row wins on a (case-insensitive) key collision.
+    const envSeeds = addEndpointModalSource.match(
+      /const env: Record<string, string> = \{ \.\.\.catalogValues\.env \};/g,
+    ) ?? [];
+    const headerMerges = addEndpointModalSource.match(
+      /const headers = mergeHeaders\(catalogValues\.headers, headerVars\);/g,
+    ) ?? [];
+    expect(envSeeds.length).toBe(2);
+    expect(headerMerges.length).toBe(2);
+    // No inline case-sensitive header assignment remains.
+    expect(addEndpointModalSource).not.toMatch(/headers\[h\.key\.trim\(\)\] = h\.value;/);
+  });
+
+  it('skips the add-time OAuth probe when the catalog entry supplies header credentials', () => {
+    // The GitHub remote server advertises OAuth, so without this gate a user
+    // who entered a PAT would be shown the "supports OAuth" escalation prompt
+    // (whose "Keep unauthenticated" option misdescribes the bearer-PAT add).
+    // `catalogValues` must be computed before the probe so the gate can see
+    // the header-typed values.
+    const handleSubmitBlock = addEndpointModalSource.match(
+      /async function handleSubmit\([\s\S]*?const trimmedName = name\.trim\(\);/,
+    );
+    expect(handleSubmitBlock, 'expected the handleSubmit pre-add body').not.toBeNull();
+    expect(handleSubmitBlock![0]).toMatch(
+      /const catalogValues = selectedCatalog\s*\?\s*buildCatalogEnvAndHeaders\(selectedCatalog, catalogEnvValues\)[\s\S]*?const hasCatalogHeaderCredentials = Object\.keys\(catalogValues\.headers\)\.length > 0;[\s\S]*?if \(\s*!opts\?\.skipProbe &&\s*!hasCatalogHeaderCredentials &&\s*\(transport === 'http' \|\| transport === 'sse'\)\s*\) \{[\s\S]*?probe = await oauthProbe\(url\.trim\(\)\);/,
+    );
+  });
+
+  it('keeps the container toggle and volume mounts gated on the stdio transport', () => {
+    // http catalog entries (GitHub) must not show Command/Arguments or the
+    // isolation controls; both live under the stdio branch.
+    expect(addEndpointModalSource).toMatch(
+      /\{#if transport === 'stdio'\}[\s\S]*?id="modal-ep-cmd"[\s\S]*?id="modal-ep-args"[\s\S]*?id="modal-ep-isolation"[\s\S]*?\{:else if transport === 'oauth'\}/,
+    );
+    expect(addEndpointModalSource).toMatch(
+      /let showMounts = \$derived\(transport === 'stdio' && isolationEnabled && !catalogNotContainerizable\);/,
+    );
+  });
+
+  it('still shows the API Key chip for the GitHub catalog entry', () => {
+    const github = CATALOG_SERVERS.find((s) => s.id === 'github')!;
+    expect(github.envVars.some((e) => e.required)).toBe(true);
+    expect(addEndpointModalSource).toMatch(
+      /\{#if server\.envVars\.some\(e => e\.required\)\}[\s\S]*?API Key/,
+    );
   });
 });
 

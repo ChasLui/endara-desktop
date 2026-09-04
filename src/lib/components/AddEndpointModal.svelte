@@ -19,6 +19,8 @@
     hasMountRowErrors,
     buildMountExample,
     buildOrgBoundEndpointParams,
+    buildCatalogEnvAndHeaders,
+    mergeHeaders,
     type AddEndpointFieldErrors,
     type AddEndpointFormSnapshot,
     type MountRow,
@@ -334,8 +336,9 @@
     prefix = sanitizeName(server.name);
     description = server.description;
     transport = server.transport;
-    command = server.command;
-    args = server.args.join(' ');
+    command = server.command ?? '';
+    args = (server.args ?? []).join(' ');
+    url = server.url ?? '';
     selectedOrganization = '';
     catalogEnvValues = {};
     userArgValues = server.userArgs ? server.userArgs.map(() => '') : [];
@@ -443,25 +446,20 @@
       params.url = url.trim();
     }
 
-    // Build env
-    const env: Record<string, string> = {};
-    if (selectedCatalog) {
-      for (const ev of selectedCatalog.envVars) {
-        const val = catalogEnvValues[ev.name] ?? '';
-        if (val.trim()) env[ev.name] = val.trim();
-      }
-    }
+    // Build env: catalog env vars + custom env vars
+    const catalogValues = selectedCatalog
+      ? buildCatalogEnvAndHeaders(selectedCatalog, catalogEnvValues)
+      : { env: {}, headers: {} };
+    const env: Record<string, string> = { ...catalogValues.env };
     for (const e of envVars.filter((e) => e.key.trim())) {
       env[e.key.trim()] = e.value;
     }
     if (Object.keys(env).length > 0) params.env = env;
 
-    // Build headers
+    // Build headers: catalog header-typed vars + custom headers (custom wins,
+    // matched case-insensitively)
     if (transport !== 'stdio') {
-      const headers: Record<string, string> = {};
-      for (const h of headerVars.filter((h) => h.key.trim())) {
-        headers[h.key.trim()] = h.value;
-      }
+      const headers = mergeHeaders(catalogValues.headers, headerVars);
       if (Object.keys(headers).length > 0) params.headers = headers;
     }
 
@@ -542,11 +540,25 @@
       return;
     }
 
+    // Catalog env/header values are needed both to gate the OAuth probe below
+    // and to build the add params further down.
+    const catalogValues = selectedCatalog
+      ? buildCatalogEnvAndHeaders(selectedCatalog, catalogEnvValues)
+      : { env: {}, headers: {} };
+    const hasCatalogHeaderCredentials = Object.keys(catalogValues.headers).length > 0;
+
     // Add-time OAuth detection (http/sse only). Best-effort + non-blocking:
     // probe the entered URL and, if the server advertises OAuth, surface the
     // opt-out escalation prompt instead of adding. Any probe failure / timeout
     // / `oauth_supported:false` silently falls through to the plain add below.
-    if (!opts?.skipProbe && (transport === 'http' || transport === 'sse')) {
+    // Skipped when the catalog entry already supplies header credentials (e.g.
+    // the GitHub bearer PAT): the user has chosen that auth model, and the
+    // escalation prompt would misdescribe the add as unauthenticated.
+    if (
+      !opts?.skipProbe &&
+      !hasCatalogHeaderCredentials &&
+      (transport === 'http' || transport === 'sse')
+    ) {
       submitting = true;
       let probe: OAuthProbeResult = { oauth_supported: false };
       try {
@@ -635,13 +647,7 @@
     }
 
     // Build env: catalog env vars + custom env vars
-    const env: Record<string, string> = {};
-    if (selectedCatalog) {
-      for (const ev of selectedCatalog.envVars) {
-        const val = catalogEnvValues[ev.name] ?? '';
-        if (val.trim()) env[ev.name] = val.trim();
-      }
-    }
+    const env: Record<string, string> = { ...catalogValues.env };
     const filteredEnv = envVars.filter((e) => e.key.trim());
     for (const e of filteredEnv) {
       env[e.key.trim()] = e.value;
@@ -650,13 +656,10 @@
       params.env = env;
     }
 
-    // Build headers from key-value pairs
+    // Build headers: catalog header-typed vars + custom headers (custom wins,
+    // matched case-insensitively)
     if (transport !== 'stdio') {
-      const headers: Record<string, string> = {};
-      const filteredHeaders = headerVars.filter((h) => h.key.trim());
-      for (const h of filteredHeaders) {
-        headers[h.key.trim()] = h.value;
-      }
+      const headers = mergeHeaders(catalogValues.headers, headerVars);
       if (Object.keys(headers).length > 0) {
         params.headers = headers;
       }

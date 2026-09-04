@@ -1,4 +1,5 @@
 import type { OAuthCatalogEntry } from '$lib/data/oauth-catalog';
+import type { CatalogServer } from '$lib/catalog';
 import type { AddEndpointParams, EmaAuthConfig } from '$lib/api';
 
 export type ScopeMode = 'free' | 'checkbox';
@@ -52,6 +53,62 @@ export function buildScopesPayload(
  */
 export function shouldShowManualOAuthStar(entry: OAuthCatalogEntry): boolean {
   return entry.supportsDcr === false;
+}
+
+/**
+ * Splits the values the user entered for a catalog entry's config vars into
+ * the `env` and `headers` maps sent to the relay. Vars carrying a `header`
+ * target land in `headers` under the header name with `valuePrefix`
+ * prepended (e.g. the GitHub PAT becomes `Authorization: Bearer ghp_...`);
+ * all others land in `env`
+ * under the var name. Values and header names are trimmed; empty values and
+ * blank header names are skipped.
+ */
+export function buildCatalogEnvAndHeaders(
+  catalog: Pick<CatalogServer, 'envVars'>,
+  values: Record<string, string>,
+): { env: Record<string, string>; headers: Record<string, string> } {
+  const env: Record<string, string> = {};
+  const headers: Record<string, string> = {};
+  for (const ev of catalog.envVars) {
+    const value = (values[ev.name] ?? '').trim();
+    if (!value) continue;
+    if (ev.header) {
+      const headerName = ev.header.name.trim();
+      if (!headerName) continue;
+      headers[headerName] = `${ev.header.valuePrefix ?? ''}${value}`;
+    } else {
+      env[ev.name] = value;
+    }
+  }
+  return { env, headers };
+}
+
+/**
+ * Applies the user's custom header rows on top of catalog-seeded headers.
+ * HTTP header names are case-insensitive, so a custom row replaces any seeded
+ * key that matches ignoring case (e.g. `authorization` overrides
+ * `Authorization`) instead of adding a second, ambiguous key. Rows with a
+ * blank key are skipped. The result is a null-prototype map so user-typed
+ * keys such as `__proto__` are stored as plain entries rather than touching
+ * the object's prototype.
+ */
+export function mergeHeaders(
+  base: Record<string, string>,
+  overrides: { key: string; value: string }[],
+): Record<string, string> {
+  const merged: Record<string, string> = Object.assign(Object.create(null), base);
+  for (const row of overrides) {
+    const key = row.key.trim();
+    if (!key) continue;
+    for (const existing of Object.keys(merged)) {
+      if (existing !== key && existing.toLowerCase() === key.toLowerCase()) {
+        delete merged[existing];
+      }
+    }
+    merged[key] = row.value;
+  }
+  return merged;
 }
 
 /** Total wall-clock budget for OAuth setup polling, in milliseconds. */
